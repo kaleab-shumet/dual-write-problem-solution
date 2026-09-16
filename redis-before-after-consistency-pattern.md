@@ -140,7 +140,7 @@ In all three branches (success, rejection, crash), the worst possible outcome is
 
 Concurrent updates to the same user are a separate concern, handled entirely by Postgres: if two requests both try to change `user-42`'s phone number at once, both will read `version = 1`, but only one `UPDATE ... WHERE version = 1` can succeed — the other gets zero rows affected and must retry against the new version rather than silently overwrite. Postgres's version column protects against concurrent writes; the UUID fence protects against trusting an *unconfirmed* cache write. They're doing different jobs.
 
-## The naive version has three bugs — here's how to fix them
+## The naive version has four gaps — here's how to fix them
 
 I want to flag these clearly, because the pattern above sounds airtight in prose and isn't, until you close these gaps.
 
@@ -182,15 +182,24 @@ for key in redis.smembers("dirty_keys"):
         redis.srem("dirty_keys", key)
         continue
     row = postgres.query("SELECT phone_number, version FROM users WHERE id = %s", extract_id(key))
-    redis.eval(UPDATE_AFTER_SCRIPT, 1, key, before, json.dumps(row), row.version)
-    redis.srem("dirty_keys", key)
+    redis.eval(REPAIR_FROM_DB_SCRIPT, 2, key, "dirty_keys",
+               json.dumps(row), new_uuid(), row.version, now_ms())
 ```
 
 Note the worker writes through the *same* version-gated script — it must never blindly overwrite, in case the value has moved on again since the key was queued as dirty. The demo also uses a short-lived Redis lease per user for normal API writes, request-triggered repairs, and worker repairs. This coordinates repair work for hot keys and prevents the worker from changing fencing markers during an API update. Other readers briefly wait for the lease holder to restore a trusted cache entry, then fall back to Postgres if the lease expires.
 
+**4. A dirty hot key can create a cache stampede.** If many readers see the
+same mismatch, they can all query Postgres at once. The shared per-user lease
+provides singleflight coordination: one request acquires `lock:user:<id>`,
+reads Postgres, and repairs Redis. Other readers briefly poll for a trusted
+cache entry, then fall back to Postgres if the repair does not finish within
+the wait window. Normal API writes and the background worker use the same
+lease, so they cannot repair or update the same key concurrently while the
+lease is valid.
+
 ## What this does and doesn't cover
 
-With the three fixes in place, the pattern guarantees Redis is never served as authoritative unless it demonstrably reflects a committed Postgres write, and that crashes, rejected writes, and races all degrade into cache misses rather than wrong answers, without the request path ever blocking on the repair worker.
+With the four protections in place, the pattern guarantees Redis is never served as authoritative unless it demonstrably reflects a committed Postgres write, and that crashes, rejected writes, and races all degrade into cache misses rather than wrong answers. The request path may wait briefly for the repair lease, but it does not wait indefinitely for the worker: it falls back to Postgres when the wait window expires.
 
 It does *not* cover everything on its own. Redis failing over mid-write (Sentinel/Cluster) can still lose a `BEFORE` or `AFTER` write independently — the fallback behavior absorbs this, but it's worth deliberately testing (kill Redis, kill the app, kill the worker, check nothing corrupted gets served). A repair worker that's down for a long stretch can leave a key permanently mismatched, so a safety TTL is worth adding. The repair lease reduces the cache-stampede risk, but lease expiry or a database operation that outlives the lease can still cause extra Postgres reads, so lease duration and fallback volume should be monitored. And it's worth instrumenting the mismatch-driven cache-miss rate separately from ordinary TTL misses, so you can tell whether the cache is actually doing its job under real write load or just constantly falling back.
 
