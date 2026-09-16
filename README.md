@@ -292,6 +292,54 @@ The worker interval is intentionally slow in the demo so you have time to see
 the fallback behavior. Use **Repair once** in the UI when you want to repair
 immediately.
 
+## How This Compares To Outbox/CDC
+
+Outbox and CDC are the established production patterns for avoiding direct
+dual-writes. They keep Postgres as the only write path, then update Redis
+asynchronously from an outbox table or database log.
+
+This demo explores a different tradeoff. Instead of eliminating the second
+write, it makes Redis prove whether a cached value is safe to serve. If Redis
+cannot prove that, the read path falls back to Postgres.
+
+Hypothetically, this can be useful when:
+
+- you do not already operate CDC infrastructure
+- you want successful writes to update Redis immediately
+- you prefer worker lag to become a cache miss instead of silent cache lag
+- you want each cache entry to carry its own trust signal
+- your system is small enough that adding Debezium, Kafka, or outbox processing
+  would be operationally heavier than this guarded cache pattern
+
+The caveat: this repository is a demo, not a production-proven replacement for
+outbox or CDC. A production version would need testing around Redis failover,
+concurrent writes, repair lag, cache stampedes, monitoring, and operational
+recovery.
+
+## Limitations
+
+This pattern improves cache correctness, but it does not make Redis and
+Postgres a single atomic system.
+
+- **Redis failover can still lose cache writes.** If Redis acknowledges a
+  `BEFORE` or `AFTER` write and then fails over before that write is replicated,
+  the cache may move backward. The read path still treats mismatches as unsafe,
+  but production deployments should test Redis Sentinel/Cluster failover
+  behavior deliberately.
+- **Dirty entries can stay dirty if repair is down.** A crash after Postgres
+  commit is safe because reads fall back to Postgres, but the cache may remain
+  cold for that key until the worker catches up. Production systems should
+  monitor dirty-key age and mismatch-driven cache misses.
+- **Fallbacks can cause a cache stampede.** If many readers hit the same
+  untrusted key at once, they may all fall through to Postgres. Add request
+  coalescing, short-lived in-flight markers, or rate limits for high-traffic
+  keys.
+
+If you already run CDC or an outbox pipeline, that is often the cleaner
+long-term architecture: one write path into Postgres, then asynchronous cache
+population from the database log. This repo is about making a direct
+Redis-plus-Postgres write path safer when you are not using that infrastructure.
+
 ## Commands
 
 Start:
