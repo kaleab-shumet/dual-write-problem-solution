@@ -298,6 +298,12 @@ Outbox and CDC are the established production patterns for avoiding direct
 dual-writes. They keep Postgres as the only write path, then update Redis
 asynchronously from an outbox table or database log.
 
+The cost is operational complexity and propagation lag. You need to run and
+monitor the outbox processor or CDC pipeline, handle retries and poison events,
+manage replication slots or polling, and make sure Redis catches up quickly
+enough for your freshness needs. When that worker or pipeline is slow, worker
+lag becomes cache lag: Redis may keep serving older data until it catches up.
+
 This demo explores a different tradeoff. Instead of eliminating the second
 write, it makes Redis prove whether a cached value is safe to serve. If Redis
 cannot prove that, the read path falls back to Postgres.
