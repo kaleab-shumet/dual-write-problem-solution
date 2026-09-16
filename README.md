@@ -298,6 +298,36 @@ The worker interval is intentionally slow in the demo so you have time to see
 the fallback behavior. Use **Repair once** in the UI when you want to repair
 immediately.
 
+## Singleflight Coordination
+
+Fencing prevents an unsafe Redis read, but many simultaneous reads of the same
+dirty key could still overload Postgres. The demo limits that work with a
+short-lived Redis lease per user:
+
+```text
+1. One request acquires lock:user:42.
+2. It reads Postgres and repairs Redis.
+3. Other requests briefly wait for Redis to become trusted.
+4. They serve the repaired value from Redis, or fall back to Postgres after
+   the wait period.
+```
+
+Normal API writes, request-triggered repairs, and background worker repairs all
+use the same lease. This prevents a worker from changing a key while an API
+update is between its `BEFORE` and `AFTER` steps. The lease has an owner token,
+is released atomically, and expires automatically if its owner crashes.
+
+The defaults are suitable for the demo:
+
+```text
+USER_LOCK_TTL_MS=5000   lock lifetime
+USER_LOCK_WAIT_MS=300   reader/writer wait time
+```
+
+These settings are coordination controls, not correctness controls. UUID
+matching, database versions, and Postgres remain responsible for deciding
+whether a cached value is safe.
+
 ## How This Compares To Outbox/CDC
 
 Outbox and CDC are the established production patterns for avoiding direct
