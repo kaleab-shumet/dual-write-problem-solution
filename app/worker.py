@@ -42,7 +42,7 @@ async def repair_loop() -> None:
                     if repaired:
                         logger.info("repaired %s from Postgres version %s", key, row["version"])
                     else:
-                        logger.info("skipped %s because cache has a newer tentative version", key)
+                        logger.info("skipped %s because cache has newer confirmed state", key)
                 except Exception:
                     logger.exception("failed to repair %s", key)
 

@@ -62,13 +62,13 @@ Both cases are forms of the dual-write problem: the app tried to coordinate two
 systems, but only one side finished.
 
 This demo uses a small fencing pattern that makes Redis admit when it might be
-wrong. Instead of treating a cached value as automatically safe, Redis stores two
-pieces of metadata for each update attempt:
+wrong. Instead of treating a cached value as automatically safe, Redis separates
+an in-flight marker from the last confirmed value:
 
-- `BEFORE`: the tentative cached value plus a UUID, written before the
-  Postgres update is attempted
-- `AFTER`: the UUID of the update that Postgres has confirmed, written only
-  after Postgres commits
+- `BEFORE`: a UUID marker written before the Postgres update is attempted. It
+  does not contain a value.
+- `AFTER`: the UUID and full row that Postgres has confirmed, written only
+  after Postgres commits.
 
 The read rule is:
 
@@ -90,9 +90,9 @@ Postgres:
   user:42 name = "Ada Lovelace", version = 1
 
 Redis:
-  value       = { "name": "Ada Lovelace", "version": 1 }
   before_uuid = UUID-A
   after_uuid  = UUID-A
+  value       = { "name": "Ada Lovelace", "version": 1 }
 
 Read result:
   before_uuid == after_uuid
@@ -107,9 +107,9 @@ Postgres:
   user:42 name = "Katherine Johnson", version = 2
 
 Redis:
-  value       = { "name": "Katherine Johnson", "version": 2 }
   before_uuid = UUID-B
   after_uuid  = UUID-A
+  value       = { "name": "Ada Lovelace", "version": 1 }
 
 Read result:
   before_uuid != after_uuid
@@ -117,10 +117,11 @@ Read result:
   -> read Postgres
 ```
 
-The cache contains the new value, but the app still refuses to serve it from
-Redis because Redis cannot prove the update was confirmed. After the repair
-worker catches up, Redis writes a matching `AFTER` UUID and future reads can use
-the cache again.
+Redis still contains only the last confirmed value. The app refuses to serve it
+because a newer in-flight `BEFORE` marker exists and Redis cannot prove that
+attempt was confirmed. After the repair worker catches up, Redis writes a
+matching `AFTER` UUID with the confirmed row from Postgres, and future reads can
+use the cache again.
 
 The longer design write-up is in
 [`redis-before-after-consistency-pattern.md`](redis-before-after-consistency-pattern.md).
@@ -261,19 +262,19 @@ Redis stores the cached user profile as a hash:
 key: user:42
 
 value              JSON user profile
-before_uuid        UUID for the latest attempted write
+before_uuid        UUID marker for the latest attempted write
 after_uuid         UUID for the latest confirmed write
-version            tentative/cache version
-confirmed_version  latest confirmed Postgres version
+confirmed_version  DB row version corresponding to value
 ```
 
 On update:
 
-1. The backend writes `BEFORE` to Redis with the tentative user profile and a
-   fresh UUID.
+1. The backend writes `BEFORE` to Redis with a fresh UUID marker only.
 2. Redis is now untrusted because `before_uuid != after_uuid`.
-3. The backend updates Postgres using optimistic concurrency.
-4. If Postgres commits, the backend writes `AFTER` with the same UUID.
+3. The backend updates Postgres using optimistic concurrency and gets the final
+   row back from `RETURNING`.
+4. If Postgres commits, the backend writes `AFTER` with the same UUID and the
+   confirmed full row.
 5. Redis is trusted again only if the UUIDs match.
 
 If Postgres rejects the update, or the app crashes after Postgres commits but

@@ -39,12 +39,12 @@ What follows is basically an application of the second idea (fencing tokens), ap
 
 ## The pattern: BEFORE/AFTER fencing
 
-Instead of storing a Redis entry as a single value, split it into two fields that must agree before the entry is trusted:
+Instead of storing a Redis entry as a single value, split it into an in-flight marker and a confirmed value that must agree before the entry is trusted:
 
 | Field | Contents | Written |
 |---|---|---|
-| `BEFORE` | tentative value + a UUID | *before* attempting the Postgres write |
-| `AFTER` | the UUID only | *after* Postgres confirms the write succeeded |
+| `BEFORE` | UUID marker only | *before* attempting the Postgres write |
+| `AFTER` | UUID + confirmed value | *after* Postgres confirms the write succeeded |
 
 The trust rule is one comparison:
 
@@ -53,16 +53,16 @@ BEFORE.uuid == AFTER.uuid   →  trust Redis
 BEFORE.uuid != AFTER.uuid   →  don't trust it, read Postgres
 ```
 
-The UUID tags one specific update attempt. `AFTER` only ever advances once *that* attempt is confirmed durable. If anything goes wrong in between — a rejected write, a crash, a lost process — `AFTER` just never catches up, and the mismatch is itself the signal that something's unresolved. Postgres stays the single source of truth throughout; Redis is only ever allowed to answer when it can prove it reflects a completed Postgres transaction.
+The UUID tags one specific update attempt. `BEFORE` is only a marker; it never carries the tentative value. `AFTER` is the only place the cached value lives, and it only advances once *that* attempt is confirmed durable by Postgres. If anything goes wrong in between — a rejected write, a crash, a lost process — `AFTER` just never catches up, and the mismatch is itself the signal that something's unresolved. Postgres stays the single source of truth throughout; Redis is only ever allowed to answer when it can prove it reflects a completed Postgres transaction.
 
 ## What BEFORE and AFTER actually mean
 
 Before the example, it's worth being precise about the two names, because they're doing exactly what they say:
 
-- **BEFORE** = the state written *before* the Postgres write is attempted. It holds the tentative new value plus a fresh UUID that identifies this specific attempt. Writing it is how the cache immediately marks itself "don't trust me yet" the moment a change starts.
-- **AFTER** = the state written *after* the Postgres write is confirmed to have succeeded. It holds only the UUID — no value — and its only job is to say "the attempt tagged with this UUID is now durable in Postgres."
+- **BEFORE** = the marker written *before* the Postgres write is attempted. It holds only a fresh UUID that identifies this specific attempt. Writing it is how the cache immediately marks itself "don't trust me yet" the moment a change starts.
+- **AFTER** = the state written *after* the Postgres write is confirmed to have succeeded. It holds the UUID plus the full confirmed value returned by Postgres. It is the only place the cached value lives.
 
-So `BEFORE` is set at the *start* of a change, and `AFTER` is set at the *end*, only if that change actually landed. As long as those two UUIDs match, every part of the update — tentative write, database commit, confirmation — has completed for the *same* attempt, and the cached value can be trusted. The moment they diverge, you know something in that sequence is incomplete, and you fall back to Postgres until it's resolved.
+So `BEFORE` is set at the *start* of a change, and `AFTER` is set at the *end*, only if that change actually landed. As long as those two UUIDs match, every part of the update — in-flight marker, database commit, confirmation — has completed for the *same* attempt, and `AFTER.value` can be trusted. The moment they diverge, you know something in that sequence is incomplete, and you fall back to Postgres until it's resolved.
 
 ## Walking through it: updating a user's phone number
 
@@ -75,8 +75,8 @@ Postgres (users table):
   version = 1
 
 Redis (hash key: user:42):
-  BEFORE = { value: "+1-555-0100", uuid: "UUID-A" }
-  AFTER  = { uuid: "UUID-A" }
+  BEFORE = { uuid: "UUID-A" }
+  AFTER  = { uuid: "UUID-A", value: "+1-555-0100", version: 1 }
 ```
 
 `BEFORE.uuid == AFTER.uuid` → Redis is trusted. Any read of the user's phone number (an SMS-sending job, a profile page) is served straight from cache, no Postgres round-trip needed.
@@ -88,11 +88,11 @@ Generate a new UUID for this attempt: `UUID-B`.
 ### Step 2 — write BEFORE, immediately marking the cache untrusted
 
 ```
-Redis: BEFORE = { value: "+1-555-0199", uuid: "UUID-B" }
-       AFTER  = { uuid: "UUID-A" }   ← unchanged, still the old attempt
+Redis: BEFORE = { uuid: "UUID-B" }
+       AFTER  = { uuid: "UUID-A", value: "+1-555-0100", version: 1 }
 ```
 
-At this instant, `UUID-B != UUID-A`. Any request that reads the cache right now — even microseconds after this write — correctly detects the mismatch and falls back to Postgres, which still returns the *old* number, `+1-555-0100`. The new, unconfirmed number is never served as if it were real. This matters concretely here: an SMS 2FA job that fires mid-update should never send a code to a number that was typed in but never actually saved.
+At this instant, `UUID-B != UUID-A`. Any request that reads the cache right now — even microseconds after this write — correctly detects the mismatch and falls back to Postgres, which still returns the *old* number, `+1-555-0100`. The new, unconfirmed number is not in Redis at all. This matters concretely here: an SMS 2FA job that fires mid-update should never send a code to a number that was typed in but never actually saved.
 
 ### Step 3 — attempt the Postgres write, using optimistic concurrency
 
@@ -109,8 +109,8 @@ WHERE id = 'user-42'
 Write AFTER, confirming this specific attempt:
 
 ```
-Redis: BEFORE = { value: "+1-555-0199", uuid: "UUID-B" }
-       AFTER  = { uuid: "UUID-B" }   ← now matches
+Redis: BEFORE = { uuid: "UUID-B" }
+       AFTER  = { uuid: "UUID-B", value: "+1-555-0199", version: 2 }
 ```
 
 `BEFORE.uuid == AFTER.uuid` again → Redis is trusted, and it now correctly serves `+1-555-0199`.
@@ -120,23 +120,23 @@ Redis: BEFORE = { value: "+1-555-0199", uuid: "UUID-B" }
 `AFTER` is simply never touched. Redis is left as:
 
 ```
-BEFORE = { value: "+1-555-0199", uuid: "UUID-B" }
-AFTER  = { uuid: "UUID-A" }
+BEFORE = { uuid: "UUID-B" }
+AFTER  = { uuid: "UUID-A", value: "+1-555-0100", version: 1 }
 ```
 
-The mismatch persists indefinitely. Every read falls through to Postgres, which still correctly holds `+1-555-0100`. The rejected change never leaks into a served response.
+The mismatch persists until repair clears the marker. Every read falls through to Postgres, which still correctly holds `+1-555-0100`. The rejected change never leaks into Redis or a served response.
 
 ### Step 4c — if the app crashes right after Postgres commits, but before writing AFTER
 
 ```
 Postgres: phone_number = "+1-555-0199"   ← committed
-Redis:    BEFORE = { value: "+1-555-0199", uuid: "UUID-B" }
-          AFTER  = { uuid: "UUID-A" }     ← stale, never got the update
+Redis:    BEFORE = { uuid: "UUID-B" }
+          AFTER  = { uuid: "UUID-A", value: "+1-555-0100", version: 1 }
 ```
 
-`UUID-B != UUID-A` still holds, so every read correctly falls back to Postgres (which is right, just slower) until a background repair process notices the mismatch and catches Redis up by writing `AFTER = { uuid: "UUID-B" }`.
+`UUID-B != UUID-A` still holds, so every read correctly falls back to Postgres (which is right, just slower) until a background repair process notices the mismatch and catches Redis up by writing `AFTER = { uuid: "UUID-B", value: "+1-555-0199", version: 2 }`.
 
-In all three branches (success, rejection, crash), the worst possible outcome is a temporary cache miss that costs an extra Postgres read — never a stale or half-applied phone number served as if it were confirmed.
+In all three branches (success, rejection, crash), the worst possible outcome is a temporary cache miss that costs an extra Postgres read — never an unconfirmed phone number served as if it were confirmed.
 
 Concurrent updates to the same user are a separate concern, handled entirely by Postgres: if two requests both try to change `user-42`'s phone number at once, both will read `version = 1`, but only one `UPDATE ... WHERE version = 1` can succeed — the other gets zero rows affected and must retry against the new version rather than silently overwrite. Postgres's version column protects against concurrent writes; the UUID fence protects against trusting an *unconfirmed* cache write. They're doing different jobs.
 
@@ -149,19 +149,25 @@ I want to flag these clearly, because the pattern above sounds airtight in prose
 **2. A delayed AFTER write can clobber a newer, valid one.** Picture this interleaving on the same key:
 
 ```
-t0: Request 1 writes BEFORE(uuid=B, version=2), Postgres commits version 2
-t1: Request 2 writes BEFORE(uuid=C, version=3), Postgres commits version 3
-t2: Request 2's AFTER write lands first → AFTER = C   [correct, matches latest]
-t3: Request 1's delayed AFTER write finally arrives → AFTER = B   [wrong — overwrites a valid newer state]
+t0: Request 1 writes BEFORE(uuid=B), Postgres commits version 2
+t1: Request 2 writes BEFORE(uuid=C), Postgres commits version 3
+t2: Request 2's AFTER write lands first → AFTER = { uuid=C, value=version 3 }   [correct]
+t3: Request 1's delayed AFTER write finally arrives → AFTER = { uuid=B, value=version 2 }   [wrong — overwrites a valid newer state]
 ```
 
 This doesn't cause a *wrong answer* (the system just falls back to Postgres on the resulting mismatch), but it does cause unnecessary cache misses under concurrent writes. The fix is to make the AFTER write conditional on version, via a small Lua script:
 
 ```lua
--- KEYS[1] = cache key, ARGV[1] = uuid, ARGV[2] = postgres version for this uuid
+-- KEYS[1] = cache key
+-- ARGV[1] = uuid, ARGV[2] = confirmed value JSON, ARGV[3] = postgres version
 local current = tonumber(redis.call('HGET', KEYS[1], 'confirmed_version') or '0')
-if tonumber(ARGV[2]) > current then
-  redis.call('HSET', KEYS[1], 'after_uuid', ARGV[1], 'confirmed_version', ARGV[2])
+if tonumber(ARGV[3]) > current then
+  redis.call(
+    'HSET', KEYS[1],
+    'after_uuid', ARGV[1],
+    'value', ARGV[2],
+    'confirmed_version', ARGV[3]
+  )
   return 1
 end
 return 0
@@ -176,7 +182,7 @@ for key in redis.smembers("dirty_keys"):
         redis.srem("dirty_keys", key)
         continue
     row = postgres.query("SELECT phone_number, version FROM users WHERE id = %s", extract_id(key))
-    redis.eval(UPDATE_AFTER_SCRIPT, 1, key, generate_uuid(), row.version)
+    redis.eval(UPDATE_AFTER_SCRIPT, 1, key, before, json.dumps(row), row.version)
     redis.srem("dirty_keys", key)
 ```
 

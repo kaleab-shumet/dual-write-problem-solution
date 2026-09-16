@@ -65,23 +65,6 @@ def row_to_dict(row: asyncpg.Record | None) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def merge_user(
-    current: dict[str, Any],
-    *,
-    name: str | None = None,
-    phone_number: str | None = None,
-    version: int | None = None,
-) -> dict[str, Any]:
-    merged = dict(current)
-    if name is not None:
-        merged["name"] = name
-    if phone_number is not None:
-        merged["phone_number"] = phone_number
-    if version is not None:
-        merged["version"] = version
-    return merged
-
-
 async def snapshot(user_id: str = "42") -> dict[str, Any]:
     return {
         "postgres": row_to_dict(await db.get_user(pool(), user_id)),
@@ -128,7 +111,12 @@ async def repair_one_key(key: str) -> dict[str, Any]:
     )
     return {
         "key": key,
-        "action": "repaired" if repaired else "skipped_newer_tentative_cache",
+        "action": {
+            0: "skipped_newer_confirmed_cache",
+            1: "repaired_confirmed_newer_db_value",
+            2: "skipped_newer_in_flight_attempt",
+            3: "cleared_rejected_attempt",
+        }.get(repaired, "unknown"),
     }
 
 
@@ -178,7 +166,7 @@ async def read_user(user_id: str) -> dict[str, Any]:
     if row is None:
         raise HTTPException(status_code=404, detail=f"user {user_id} not found")
 
-    if "value" not in cached:
+    if not cached.get("before_uuid") and not cached.get("after_uuid") and "value" not in cached:
         await cache.set_trusted(redis(), user_id, dict(row), row["version"])
 
     return {
@@ -199,19 +187,11 @@ async def update_user(user_id: str, body: UserPatchRequest) -> dict[str, Any]:
     if current is None:
         raise HTTPException(status_code=404, detail=f"user {user_id} not found")
 
-    tentative_user = merge_user(
-        dict(current),
-        name=body.name,
-        phone_number=body.phone_number,
-        version=expected_version + 1,
-    )
     attempt_uuid = cache.new_uuid()
     await cache.write_before(
         redis(),
         user_id,
-        tentative_user,
         attempt_uuid,
-        expected_version + 1,
     )
 
     row = await db.update_user(
@@ -232,6 +212,7 @@ async def update_user(user_id: str, body: UserPatchRequest) -> dict[str, Any]:
         redis(),
         user_id,
         attempt_uuid,
+        dict(row),
         row["version"],
     )
     return {
@@ -255,19 +236,11 @@ async def rejected_write(
         raise HTTPException(status_code=404, detail="user 42 not found")
 
     stale_version = max(int(row["version"]) - 1, 0)
-    tentative_user = merge_user(
-        dict(row),
-        name=body.name,
-        phone_number=body.phone_number,
-        version=stale_version + 1,
-    )
     attempt_uuid = cache.new_uuid()
     await cache.write_before(
         redis(),
         "42",
-        tentative_user,
         attempt_uuid,
-        stale_version + 1,
     )
     rejected = await db.update_user(
         pool(),
@@ -280,7 +253,7 @@ async def rejected_write(
         "outcome": "postgres_rejected_write",
         "attempt_uuid": attempt_uuid,
         "postgres_returned_row": row_to_dict(rejected),
-        "why_it_is_safe": "The tentative user profile is in Redis BEFORE, but reads fall back because BEFORE.uuid != AFTER.uuid.",
+        "why_it_is_safe": "BEFORE only contains an unconfirmed UUID marker. Reads fall back because BEFORE.uuid != AFTER.uuid.",
         "debug": await snapshot("42"),
     }
 
@@ -294,19 +267,11 @@ async def crash_after_db_commit(
     if current is None:
         raise HTTPException(status_code=404, detail="user 42 not found")
 
-    tentative_user = merge_user(
-        dict(current),
-        name=body.name,
-        phone_number=body.phone_number,
-        version=expected_version + 1,
-    )
     attempt_uuid = cache.new_uuid()
     await cache.write_before(
         redis(),
         "42",
-        tentative_user,
         attempt_uuid,
-        expected_version + 1,
     )
     row = await db.update_user(
         pool(),
@@ -341,13 +306,7 @@ async def delayed_after_race(
     starting_version = int(row["version"])
 
     uuid_b = cache.new_uuid()
-    user_b = merge_user(
-        dict(row),
-        name=body.name,
-        phone_number=body.phone_number,
-        version=starting_version + 1,
-    )
-    await cache.write_before(redis(), "42", user_b, uuid_b, starting_version + 1)
+    await cache.write_before(redis(), "42", uuid_b)
     row_b = await db.update_user(
         pool(),
         "42",
@@ -359,13 +318,7 @@ async def delayed_after_race(
         raise HTTPException(status_code=409, detail="first simulated update failed")
 
     uuid_c = cache.new_uuid()
-    user_c = merge_user(
-        dict(row_b),
-        name=body.name,
-        phone_number=body.phone_number,
-        version=starting_version + 2,
-    )
-    await cache.write_before(redis(), "42", user_c, uuid_c, starting_version + 2)
+    await cache.write_before(redis(), "42", uuid_c)
     row_c = await db.update_user(
         pool(),
         "42",
@@ -376,8 +329,8 @@ async def delayed_after_race(
     if row_c is None:
         raise HTTPException(status_code=409, detail="second simulated update failed")
 
-    confirm_c = await cache.confirm_after(redis(), "42", uuid_c, row_c["version"])
-    delayed_confirm_b = await cache.confirm_after(redis(), "42", uuid_b, row_b["version"])
+    confirm_c = await cache.confirm_after(redis(), "42", uuid_c, dict(row_c), row_c["version"])
+    delayed_confirm_b = await cache.confirm_after(redis(), "42", uuid_b, dict(row_b), row_b["version"])
 
     return {
         "outcome": "newer_confirm_won",
