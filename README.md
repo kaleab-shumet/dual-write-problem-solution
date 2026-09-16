@@ -1,3 +1,18 @@
+I kept running into the same nagging question in projects that use Redis in
+front of Postgres: when a read hits the cache, how do I actually know it's safe
+to trust? Most setups just assume it is, and deal with staleness via a TTL.
+That's fine until the two writes — one to Postgres, one to Redis — land on
+either side of a crash or a rejected update, and now the cache is confidently
+wrong with no way to tell.
+
+Rather than accept that as a cost of doing business, I wanted a cache that could
+prove whether it was trustworthy on every single read. That's what this repo
+demonstrates: a small "fencing" pattern (BEFORE/AFTER UUIDs) that turns every
+failure mode — a rejected write, an app crash mid-update, a stale confirmation
+arriving late — into a harmless cache miss instead of a wrong answer. The demo
+app lets you trigger each of those failures yourself and watch the fallback
+happen live.
+
 # Redis BEFORE/AFTER Fencing Demo
 
 When an application writes to both Postgres and Redis, it cannot make those two
