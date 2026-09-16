@@ -22,27 +22,34 @@ async def repair_loop() -> None:
             for key in keys:
                 try:
                     user_id = cache.user_id_from_cache_key(key)
-                    cached = await cache.get_cache(redis, user_id)
-                    if cached.get("trusted"):
-                        await cache.remove_dirty(redis, key)
-                        logger.info("removed already trusted key %s", key)
+                    owner_token = cache.new_uuid()
+                    if not await cache.acquire_user_lock(redis, user_id, owner_token):
+                        logger.info("skipped %s because another repair owns the lock", key)
                         continue
+                    try:
+                        cached = await cache.get_cache(redis, user_id)
+                        if cached.get("trusted"):
+                            await cache.remove_dirty(redis, key)
+                            logger.info("removed already trusted key %s", key)
+                            continue
 
-                    row = await db.get_user(db_pool, user_id)
-                    if row is None:
-                        logger.warning("dirty key %s has no Postgres row", key)
-                        continue
+                        row = await db.get_user(db_pool, user_id)
+                        if row is None:
+                            logger.warning("dirty key %s has no Postgres row", key)
+                            continue
 
-                    repaired = await cache.repair_from_db(
-                        redis,
-                        user_id,
-                        dict(row),
-                        row["version"],
-                    )
-                    if repaired:
-                        logger.info("repaired %s from Postgres version %s", key, row["version"])
-                    else:
-                        logger.info("skipped %s because cache has newer confirmed state", key)
+                        repaired = await cache.repair_from_db(
+                            redis,
+                            user_id,
+                            dict(row),
+                            row["version"],
+                        )
+                        if repaired:
+                            logger.info("repaired %s from Postgres version %s", key, row["version"])
+                        else:
+                            logger.info("skipped %s because cache has newer confirmed state", key)
+                    finally:
+                        await cache.release_user_lock(redis, user_id, owner_token)
                 except Exception:
                     logger.exception("failed to repair %s", key)
 

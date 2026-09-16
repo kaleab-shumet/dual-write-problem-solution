@@ -288,6 +288,11 @@ confirmed version.
 
 The worker scans Redis `dirty_keys`, reads the current row from Postgres, and
 repairs untrusted cache entries using the same version-gated Redis script.
+The API and worker coordinate through a short-lived per-user Redis lease. The
+lease covers normal writes and repairs, so a worker cannot repair a key while
+an API update is changing its fencing markers. If several requests encounter
+the same dirty key, one request repairs it while the others briefly wait for a
+trusted cache entry before falling back to Postgres.
 
 The worker interval is intentionally slow in the demo so you have time to see
 the fallback behavior. Use **Repair once** in the UI when you want to repair
@@ -337,10 +342,11 @@ Postgres a single atomic system.
   commit is safe because reads fall back to Postgres, but the cache may remain
   cold for that key until the worker catches up. Production systems should
   monitor dirty-key age and mismatch-driven cache misses.
-- **Fallbacks can cause a cache stampede.** If many readers hit the same
-  untrusted key at once, they may all fall through to Postgres. Add request
-  coalescing, short-lived in-flight markers, or rate limits for high-traffic
-  keys.
+- **The repair lease is best-effort coordination.** A short lease reduces
+  cache stampedes and coordinates API repairs with the worker, but it is not a
+  replacement for the UUID and version checks. Production systems should size
+  the lease for their database latency, handle lease expiry, and monitor
+  fallback volume for hot keys.
 
 If you already run CDC or an outbox pipeline, that is often the cleaner
 long-term architecture: one write path into Postgres, then asynchronous cache

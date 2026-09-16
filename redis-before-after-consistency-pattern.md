@@ -186,13 +186,13 @@ for key in redis.smembers("dirty_keys"):
     redis.srem("dirty_keys", key)
 ```
 
-Note the worker writes through the *same* version-gated script — it must never blindly overwrite, in case the value has moved on again since the key was queued as dirty.
+Note the worker writes through the *same* version-gated script — it must never blindly overwrite, in case the value has moved on again since the key was queued as dirty. The demo also uses a short-lived Redis lease per user for normal API writes, request-triggered repairs, and worker repairs. This coordinates repair work for hot keys and prevents the worker from changing fencing markers during an API update. Other readers briefly wait for the lease holder to restore a trusted cache entry, then fall back to Postgres if the lease expires.
 
 ## What this does and doesn't cover
 
 With the three fixes in place, the pattern guarantees Redis is never served as authoritative unless it demonstrably reflects a committed Postgres write, and that crashes, rejected writes, and races all degrade into cache misses rather than wrong answers, without the request path ever blocking on the repair worker.
 
-It does *not* cover everything on its own. Redis failing over mid-write (Sentinel/Cluster) can still lose a `BEFORE` or `AFTER` write independently — the fallback behavior absorbs this, but it's worth deliberately testing (kill Redis, kill the app, kill the worker, check nothing corrupted gets served). A repair worker that's down for a long stretch can leave a key permanently mismatched, so a safety TTL is worth adding. Many concurrent readers hitting a key mid-update can all fall through to Postgres at once — a short-lived "in-flight" marker smooths that out. And it's worth instrumenting the mismatch-driven cache-miss rate separately from ordinary TTL misses, so you can tell whether the cache is actually doing its job under real write load or just constantly falling back.
+It does *not* cover everything on its own. Redis failing over mid-write (Sentinel/Cluster) can still lose a `BEFORE` or `AFTER` write independently — the fallback behavior absorbs this, but it's worth deliberately testing (kill Redis, kill the app, kill the worker, check nothing corrupted gets served). A repair worker that's down for a long stretch can leave a key permanently mismatched, so a safety TTL is worth adding. The repair lease reduces the cache-stampede risk, but lease expiry or a database operation that outlives the lease can still cause extra Postgres reads, so lease duration and fallback volume should be monitored. And it's worth instrumenting the mismatch-driven cache-miss rate separately from ordinary TTL misses, so you can tell whether the cache is actually doing its job under real write load or just constantly falling back.
 
 ## Where this leaves you
 

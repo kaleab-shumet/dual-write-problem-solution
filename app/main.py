@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 
 from app import cache, db
-from app.settings import DATABASE_URL, REDIS_URL
+from app.settings import DATABASE_URL, REDIS_URL, USER_LOCK_WAIT_MS
 
 
 class UserPatchRequest(BaseModel):
@@ -94,30 +95,58 @@ async def current_expected_version(user_id: str, explicit: int | None) -> int:
 
 async def repair_one_key(key: str) -> dict[str, Any]:
     user_id = cache.user_id_from_cache_key(key)
-    cached = await cache.get_cache(redis(), user_id)
-    if cached.get("trusted"):
-        await cache.remove_dirty(redis(), key)
-        return {"key": key, "action": "already_trusted"}
+    owner_token = cache.new_uuid()
+    if not await cache.acquire_user_lock(redis(), user_id, owner_token):
+        return {"key": key, "action": "skipped_lock_owned_by_another_repair"}
 
-    row = await db.get_user(pool(), user_id)
-    if row is None:
-        return {"key": key, "action": "missing_postgres_row"}
+    try:
+        cached = await cache.get_cache(redis(), user_id)
+        if cached.get("trusted"):
+            await cache.remove_dirty(redis(), key)
+            return {"key": key, "action": "already_trusted"}
 
-    repaired = await cache.repair_from_db(
-        redis(),
-        user_id,
-        dict(row),
-        row["version"],
-    )
-    return {
-        "key": key,
-        "action": {
-            0: "skipped_newer_confirmed_cache",
-            1: "repaired_confirmed_newer_db_value",
-            2: "skipped_newer_in_flight_attempt",
-            3: "cleared_rejected_attempt",
-        }.get(repaired, "unknown"),
-    }
+        row = await db.get_user(pool(), user_id)
+        if row is None:
+            return {"key": key, "action": "missing_postgres_row"}
+
+        repaired = await cache.repair_from_db(
+            redis(),
+            user_id,
+            dict(row),
+            row["version"],
+        )
+        return {
+            "key": key,
+            "action": {
+                0: "skipped_newer_confirmed_cache",
+                1: "repaired_confirmed_newer_db_value",
+                2: "skipped_newer_in_flight_attempt",
+                3: "cleared_rejected_attempt",
+            }.get(repaired, "unknown"),
+        }
+    finally:
+        await cache.release_user_lock(redis(), user_id, owner_token)
+
+
+async def acquire_write_lock(user_id: str) -> str:
+    owner_token = cache.new_uuid()
+    deadline = asyncio.get_running_loop().time() + USER_LOCK_WAIT_MS / 1000
+    while True:
+        if await cache.acquire_user_lock(redis(), user_id, owner_token):
+            return owner_token
+        if asyncio.get_running_loop().time() >= deadline:
+            raise HTTPException(status_code=503, detail="user is busy; retry shortly")
+        await asyncio.sleep(0.03)
+
+
+async def wait_for_trusted_cache(user_id: str) -> dict[str, Any] | None:
+    attempts = max(1, USER_LOCK_WAIT_MS // 30)
+    for _ in range(attempts):
+        cached = await cache.get_cache(redis(), user_id)
+        if cached.get("trusted"):
+            return cached
+        await asyncio.sleep(0.03)
+    return None
 
 
 @app.get("/")
@@ -162,12 +191,35 @@ async def read_user(user_id: str) -> dict[str, Any]:
             "debug": await snapshot(user_id),
         }
 
+    owner_token = cache.new_uuid()
+    if not await cache.acquire_user_lock(redis(), user_id, owner_token):
+        repaired_cache = await wait_for_trusted_cache(user_id)
+        if repaired_cache:
+            return {
+                "served_from": "redis",
+                "trusted_cache": True,
+                "user": repaired_cache["value"],
+                "debug": await snapshot(user_id),
+            }
+    else:
+        try:
+            cached = await cache.get_cache(redis(), user_id)
+            if cached.get("trusted"):
+                return {
+                    "served_from": "redis",
+                    "trusted_cache": True,
+                    "user": cached["value"],
+                    "debug": await snapshot(user_id),
+                }
+            row = await db.get_user(pool(), user_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"user {user_id} not found")
+            await cache.repair_from_db(redis(), user_id, dict(row), row["version"])
+        finally:
+            await cache.release_user_lock(redis(), user_id, owner_token)
     row = await db.get_user(pool(), user_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"user {user_id} not found")
-
-    if not cached.get("before_uuid") and not cached.get("after_uuid") and "value" not in cached:
-        await cache.set_trusted(redis(), user_id, dict(row), row["version"])
 
     return {
         "served_from": "postgres",
@@ -182,46 +234,22 @@ async def update_user(user_id: str, body: UserPatchRequest) -> dict[str, Any]:
     if body.name is None and body.phone_number is None:
         raise HTTPException(status_code=422, detail="Provide name, phone_number, or both.")
 
-    expected_version = await current_expected_version(user_id, body.expected_version)
-    current = await db.get_user(pool(), user_id)
-    if current is None:
-        raise HTTPException(status_code=404, detail=f"user {user_id} not found")
+    owner_token = await acquire_write_lock(user_id)
+    try:
+        expected_version = await current_expected_version(user_id, body.expected_version)
+        current = await db.get_user(pool(), user_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail=f"user {user_id} not found")
 
-    attempt_uuid = cache.new_uuid()
-    await cache.write_before(
-        redis(),
-        user_id,
-        attempt_uuid,
-    )
-
-    row = await db.update_user(
-        pool(),
-        user_id,
-        body.name,
-        body.phone_number,
-        expected_version,
-    )
-    if row is None:
-        return {
-            "outcome": "postgres_rejected_write",
-            "why_it_is_safe": "AFTER was not written, so Redis remains untrusted.",
-            "debug": await snapshot(user_id),
-        }
-
-    confirm_result = await cache.confirm_after(
-        redis(),
-        user_id,
-        attempt_uuid,
-        dict(row),
-        row["version"],
-    )
-    return {
-        "outcome": "committed_and_confirmed",
-        "attempt_uuid": attempt_uuid,
-        "confirm_result": confirm_result,
-        "user": row_to_dict(row),
-        "debug": await snapshot(user_id),
-    }
+        attempt_uuid = cache.new_uuid()
+        await cache.write_before(redis(), user_id, attempt_uuid)
+        row = await db.update_user(pool(), user_id, body.name, body.phone_number, expected_version)
+        if row is None:
+            return {"outcome": "postgres_rejected_write", "why_it_is_safe": "AFTER was not written, so Redis remains untrusted.", "debug": await snapshot(user_id)}
+        confirm_result = await cache.confirm_after(redis(), user_id, attempt_uuid, dict(row), row["version"])
+        return {"outcome": "committed_and_confirmed", "attempt_uuid": attempt_uuid, "confirm_result": confirm_result, "user": row_to_dict(row), "debug": await snapshot(user_id)}
+    finally:
+        await cache.release_user_lock(redis(), user_id, owner_token)
 
 
 @app.post("/demo/rejected-write")
@@ -231,65 +259,50 @@ async def rejected_write(
         phone_number="+44-20-7946-0100",
     ),
 ) -> dict[str, Any]:
-    row = await db.get_user(pool(), "42")
-    if row is None:
-        raise HTTPException(status_code=404, detail="user 42 not found")
-
-    stale_version = max(int(row["version"]) - 1, 0)
-    attempt_uuid = cache.new_uuid()
-    await cache.write_before(
-        redis(),
-        "42",
-        attempt_uuid,
-    )
-    rejected = await db.update_user(
-        pool(),
-        "42",
-        body.name,
-        body.phone_number,
-        stale_version,
-    )
-    return {
-        "outcome": "postgres_rejected_write",
-        "attempt_uuid": attempt_uuid,
-        "postgres_returned_row": row_to_dict(rejected),
-        "why_it_is_safe": "BEFORE only contains an unconfirmed UUID marker. Reads fall back because BEFORE.uuid != AFTER.uuid.",
-        "debug": await snapshot("42"),
-    }
+    owner_token = await acquire_write_lock("42")
+    try:
+        row = await db.get_user(pool(), "42")
+        if row is None:
+            raise HTTPException(status_code=404, detail="user 42 not found")
+        stale_version = max(int(row["version"]) - 1, 0)
+        attempt_uuid = cache.new_uuid()
+        await cache.write_before(redis(), "42", attempt_uuid)
+        rejected = await db.update_user(pool(), "42", body.name, body.phone_number, stale_version)
+        return {
+            "outcome": "postgres_rejected_write",
+            "attempt_uuid": attempt_uuid,
+            "postgres_returned_row": row_to_dict(rejected),
+            "why_it_is_safe": "BEFORE only contains an unconfirmed UUID marker. Reads fall back because BEFORE.uuid != AFTER.uuid.",
+            "debug": await snapshot("42"),
+        }
+    finally:
+        await cache.release_user_lock(redis(), "42", owner_token)
 
 
 @app.post("/demo/crash-after-db-commit")
 async def crash_after_db_commit(
     body: DemoProfileUpdateRequest = DemoProfileUpdateRequest(),
 ) -> dict[str, Any]:
-    expected_version = await current_expected_version("42", body.expected_version)
-    current = await db.get_user(pool(), "42")
-    if current is None:
-        raise HTTPException(status_code=404, detail="user 42 not found")
-
-    attempt_uuid = cache.new_uuid()
-    await cache.write_before(
-        redis(),
-        "42",
-        attempt_uuid,
-    )
-    row = await db.update_user(
-        pool(),
-        "42",
-        body.name,
-        body.phone_number,
-        expected_version,
-    )
-    if row is None:
-        return {"outcome": "postgres_rejected_write", "debug": await snapshot("42")}
-
-    return {
-        "outcome": "simulated_crash_after_postgres_commit",
-        "attempt_uuid": attempt_uuid,
-        "important_part": "The API intentionally did not write AFTER. Reads are safe because Redis is now untrusted.",
-        "user": row_to_dict(row),
-        "debug": await snapshot("42"),
-    }
+    owner_token = await acquire_write_lock("42")
+    try:
+        expected_version = await current_expected_version("42", body.expected_version)
+        current = await db.get_user(pool(), "42")
+        if current is None:
+            raise HTTPException(status_code=404, detail="user 42 not found")
+        attempt_uuid = cache.new_uuid()
+        await cache.write_before(redis(), "42", attempt_uuid)
+        row = await db.update_user(pool(), "42", body.name, body.phone_number, expected_version)
+        if row is None:
+            return {"outcome": "postgres_rejected_write", "debug": await snapshot("42")}
+        return {
+            "outcome": "simulated_crash_after_postgres_commit",
+            "attempt_uuid": attempt_uuid,
+            "important_part": "The API intentionally did not write AFTER. Reads are safe because Redis is now untrusted.",
+            "user": row_to_dict(row),
+            "debug": await snapshot("42"),
+        }
+    finally:
+        await cache.release_user_lock(redis(), "42", owner_token)
 
 
 @app.post("/demo/delayed-after-race")
@@ -306,26 +319,22 @@ async def delayed_after_race(
     starting_version = int(row["version"])
 
     uuid_b = cache.new_uuid()
-    await cache.write_before(redis(), "42", uuid_b)
-    row_b = await db.update_user(
-        pool(),
-        "42",
-        body.name,
-        body.phone_number,
-        starting_version,
-    )
+    owner_b = await acquire_write_lock("42")
+    try:
+        await cache.write_before(redis(), "42", uuid_b)
+        row_b = await db.update_user(pool(), "42", body.name, body.phone_number, starting_version)
+    finally:
+        await cache.release_user_lock(redis(), "42", owner_b)
     if row_b is None:
         raise HTTPException(status_code=409, detail="first simulated update failed")
 
     uuid_c = cache.new_uuid()
-    await cache.write_before(redis(), "42", uuid_c)
-    row_c = await db.update_user(
-        pool(),
-        "42",
-        body.name,
-        body.phone_number,
-        starting_version + 1,
-    )
+    owner_c = await acquire_write_lock("42")
+    try:
+        await cache.write_before(redis(), "42", uuid_c)
+        row_c = await db.update_user(pool(), "42", body.name, body.phone_number, starting_version + 1)
+    finally:
+        await cache.release_user_lock(redis(), "42", owner_c)
     if row_c is None:
         raise HTTPException(status_code=409, detail="second simulated update failed")
 

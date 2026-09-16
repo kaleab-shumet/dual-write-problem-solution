@@ -8,6 +8,15 @@ from typing import Any
 from redis.asyncio import Redis
 
 from app.settings import DIRTY_KEYS_SET
+from app.settings import USER_LOCK_TTL_MS
+
+
+LOCK_RELEASE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 WRITE_BEFORE_SCRIPT = """
@@ -55,6 +64,7 @@ local repair_uuid = before_uuid or ARGV[2]
 if db_version > current_confirmed then
   redis.call(
     'HSET', KEYS[1],
+    'before_uuid', repair_uuid,
     'value', ARGV[1],
     'after_uuid', repair_uuid,
     'confirmed_version', ARGV[3],
@@ -83,6 +93,10 @@ def cache_key(user_id: str) -> str:
     return f"user:{user_id}"
 
 
+def lock_key(user_id: str) -> str:
+    return f"lock:{cache_key(user_id)}"
+
+
 def user_id_from_cache_key(key: str) -> str:
     if not key.startswith("user:"):
         raise ValueError(f"Unknown cache key format: {key}")
@@ -95,6 +109,32 @@ def new_uuid() -> str:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+async def acquire_user_lock(
+    redis: Redis,
+    user_id: str,
+    owner_token: str,
+    ttl_ms: int = USER_LOCK_TTL_MS,
+) -> bool:
+    return bool(
+        await redis.set(
+            lock_key(user_id),
+            owner_token,
+            nx=True,
+            px=ttl_ms,
+        )
+    )
+
+
+async def release_user_lock(redis: Redis, user_id: str, owner_token: str) -> bool:
+    released = await redis.eval(
+        LOCK_RELEASE_SCRIPT,
+        1,
+        lock_key(user_id),
+        owner_token,
+    )
+    return bool(released)
 
 
 async def create_redis(redis_url: str) -> Redis:
