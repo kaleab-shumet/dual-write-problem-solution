@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>User Profile</title>
+    <link rel="stylesheet" href="/static/final.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">User service</p>
+          <h1>User profile</h1>
+        </div>
+        <nav class="nav-links" aria-label="Related pages">
+          <a href="/debug-ui">Debug UI</a>
+          <a href="/docs">API docs</a>
+        </nav>
+      </header>
+
+      <section class="summary" aria-label="Read result">
+        <div class="summary-card">
+          <span>Served from</span>
+          <strong id="servedFrom">loading</strong>
+        </div>
+        <div class="summary-card">
+          <span>Cache status</span>
+          <strong id="cacheStatus">loading</strong>
+        </div>
+        <div class="summary-card">
+          <span>Version</span>
+          <strong id="version">loading</strong>
+        </div>
+      </section>
+
+      <section class="profile-layout">
+        <article class="profile-card">
+          <div class="avatar" id="avatar">AL</div>
+          <div class="profile-main">
+            <p class="label">Profile</p>
+            <h2 id="name">Loading...</h2>
+            <dl>
+              <div>
+                <dt>User ID</dt>
+                <dd id="userId">unknown</dd>
+              </div>
+              <div>
+                <dt>Phone</dt>
+                <dd id="phone">unknown</dd>
+              </div>
+              <div>
+                <dt>Email</dt>
+                <dd id="email">unknown</dd>
+              </div>
+            </dl>
+          </div>
+        </article>
+
+        <aside class="update-card">
+          <div class="card-heading">
+            <h2>Update user</h2>
+            <button id="refreshBtn" type="button" title="Refresh">Refresh</button>
+          </div>
+          <form id="updateForm">
+            <label>
+              <span>Name</span>
+              <input id="nameInput" autocomplete="off" />
+            </label>
+            <label>
+              <span>Phone number</span>
+              <input id="phoneInput" autocomplete="off" />
+            </label>
+            <button class="primary" type="submit">Save changes</button>
+          </form>
+          <div class="scenario-actions" aria-label="Demo scenarios">
+            <button type="button" data-action="reset">Reset</button>
+            <button type="button" data-action="rejected">Rejected write</button>
+            <button type="button" data-action="crash">Crash after DB commit</button>
+            <button type="button" data-action="repair">Repair once</button>
+            <button type="button" data-action="race">Delayed AFTER race</button>
+          </div>
+        </aside>
+      </section>
+
+      <p id="message" class="message" role="status"></p>
+    </main>
+
+    <script src="/static/final.js"></script>
+  </body>
+</html>

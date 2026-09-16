@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Redis BEFORE/AFTER Fencing Demo</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Redis + Postgres consistency demo</p>
+          <h1>BEFORE/AFTER Fencing</h1>
+        </div>
+        <nav class="links" aria-label="Demo links">
+          <a href="/docs">API docs</a>
+          <a href="/debug/users/42">Raw debug</a>
+        </nav>
+      </header>
+
+      <section class="status-grid" aria-label="Current read status">
+        <div class="metric">
+          <span>Served from</span>
+          <strong id="servedFrom">unknown</strong>
+        </div>
+        <div class="metric">
+          <span>Cache trust</span>
+          <strong id="trustStatus">unknown</strong>
+        </div>
+        <div class="metric">
+          <span>User version</span>
+          <strong id="versionStatus">unknown</strong>
+        </div>
+        <div class="metric">
+          <span>Dirty keys</span>
+          <strong id="dirtyStatus">unknown</strong>
+        </div>
+      </section>
+
+      <section class="layout">
+        <aside class="panel controls-panel">
+          <div class="panel-heading">
+            <h2>Controls</h2>
+            <button id="refreshBtn" class="icon-button" type="button" title="Refresh state" aria-label="Refresh state">
+              ↻
+            </button>
+          </div>
+
+          <form id="updateForm" class="form">
+            <label>
+              <span>Name</span>
+              <input id="nameInput" name="name" autocomplete="off" />
+            </label>
+            <label>
+              <span>Phone number</span>
+              <input id="phoneInput" name="phone_number" autocomplete="off" />
+            </label>
+            <button class="primary" type="submit">Normal update</button>
+          </form>
+
+          <div class="actions">
+            <button type="button" data-action="reset">Reset</button>
+            <button type="button" data-action="rejected">Rejected write</button>
+            <button type="button" data-action="crash">Crash after DB commit</button>
+            <button type="button" data-action="repair">Repair once</button>
+            <button type="button" data-action="race">Delayed AFTER race</button>
+          </div>
+        </aside>
+
+        <section class="content">
+          <section class="panel profile-panel">
+            <div class="panel-heading">
+              <h2>User profile</h2>
+              <span id="profileBadge" class="badge neutral">loading</span>
+            </div>
+            <dl class="profile-list">
+              <div>
+                <dt>ID</dt>
+                <dd id="userId">unknown</dd>
+              </div>
+              <div>
+                <dt>Name</dt>
+                <dd id="userName">unknown</dd>
+              </div>
+              <div>
+                <dt>Phone</dt>
+                <dd id="userPhone">unknown</dd>
+              </div>
+              <div>
+                <dt>Email</dt>
+                <dd id="userEmail">unknown</dd>
+              </div>
+            </dl>
+          </section>
+
+          <section class="state-grid">
+            <article class="panel state-panel">
+              <div class="panel-heading">
+                <h2>Postgres</h2>
+                <span class="badge source-db">source of truth</span>
+              </div>
+              <pre id="postgresState">{}</pre>
+            </article>
+
+            <article class="panel state-panel">
+              <div class="panel-heading">
+                <h2>Redis</h2>
+                <span id="redisBadge" class="badge neutral">unknown</span>
+              </div>
+              <pre id="redisState">{}</pre>
+            </article>
+          </section>
+
+          <section class="panel log-panel">
+            <div class="panel-heading">
+              <h2>Event log</h2>
+              <button id="clearLogBtn" class="secondary" type="button">Clear</button>
+            </div>
+            <ol id="eventLog" class="event-log"></ol>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
