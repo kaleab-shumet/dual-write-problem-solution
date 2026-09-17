@@ -8,15 +8,6 @@ from typing import Any
 from redis.asyncio import Redis
 
 from app.settings import DIRTY_KEYS_SET
-from app.settings import USER_LOCK_TTL_MS
-
-
-LOCK_RELEASE_SCRIPT = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('DEL', KEYS[1])
-end
-return 0
-"""
 
 
 WRITE_BEFORE_SCRIPT = """
@@ -34,7 +25,7 @@ CONFIRM_AFTER_SCRIPT = """
 local current = tonumber(redis.call('HGET', KEYS[1], 'confirmed_version') or '0')
 local incoming = tonumber(ARGV[3])
 
-if incoming > current then
+if incoming > current or incoming == current then
   redis.call(
     'HSET', KEYS[1],
     'after_uuid', ARGV[1],
@@ -54,47 +45,8 @@ return 0
 """
 
 
-REPAIR_FROM_DB_SCRIPT = """
-local current_confirmed = tonumber(redis.call('HGET', KEYS[1], 'confirmed_version') or '0')
-local db_version = tonumber(ARGV[3])
-local before_uuid = redis.call('HGET', KEYS[1], 'before_uuid')
-local after_uuid = redis.call('HGET', KEYS[1], 'after_uuid')
-local repair_uuid = before_uuid or ARGV[2]
-
-if db_version > current_confirmed then
-  redis.call(
-    'HSET', KEYS[1],
-    'before_uuid', repair_uuid,
-    'value', ARGV[1],
-    'after_uuid', repair_uuid,
-    'confirmed_version', ARGV[3],
-    'before_written_at_ms', ARGV[4]
-  )
-
-  if before_uuid == repair_uuid then
-    redis.call('SREM', KEYS[2], KEYS[1])
-    return 1
-  end
-
-  return 2
-end
-
-if db_version == current_confirmed and after_uuid then
-  redis.call('HSET', KEYS[1], 'before_uuid', after_uuid, 'before_written_at_ms', ARGV[4])
-  redis.call('SREM', KEYS[2], KEYS[1])
-  return 3
-end
-
-return 0
-"""
-
-
 def cache_key(user_id: str) -> str:
     return f"user:{user_id}"
-
-
-def lock_key(user_id: str) -> str:
-    return f"lock:{cache_key(user_id)}"
 
 
 def user_id_from_cache_key(key: str) -> str:
@@ -109,32 +61,6 @@ def new_uuid() -> str:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
-
-
-async def acquire_user_lock(
-    redis: Redis,
-    user_id: str,
-    owner_token: str,
-    ttl_ms: int = USER_LOCK_TTL_MS,
-) -> bool:
-    return bool(
-        await redis.set(
-            lock_key(user_id),
-            owner_token,
-            nx=True,
-            px=ttl_ms,
-        )
-    )
-
-
-async def release_user_lock(redis: Redis, user_id: str, owner_token: str) -> bool:
-    released = await redis.eval(
-        LOCK_RELEASE_SCRIPT,
-        1,
-        lock_key(user_id),
-        owner_token,
-    )
-    return bool(released)
 
 
 async def create_redis(redis_url: str) -> Redis:
@@ -181,21 +107,11 @@ async def confirm_after(
 async def repair_from_db(
     redis: Redis,
     user_id: str,
+    attempt_uuid: str,
     user: dict[str, Any],
     postgres_version: int,
 ) -> int:
-    return int(
-        await redis.eval(
-            REPAIR_FROM_DB_SCRIPT,
-            2,
-            cache_key(user_id),
-            DIRTY_KEYS_SET,
-            encode_user(user),
-            new_uuid(),
-            str(postgres_version),
-            str(now_ms()),
-        )
-    )
+    return await confirm_after(redis, user_id, attempt_uuid, user, postgres_version)
 
 
 async def set_trusted(

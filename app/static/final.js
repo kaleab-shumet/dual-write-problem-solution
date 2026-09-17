@@ -82,24 +82,27 @@ async function request(path, options = {}) {
 }
 
 function render(payload) {
-  const user = payload.user;
+  const user = payload.user ?? payload.debug?.postgres ?? payload.debug?.redis?.value ?? {};
   const servedFrom = payload.served_from;
   const trusted = payload.trusted_cache;
 
   el.servedFrom.textContent = servedFrom;
-  el.servedFrom.className = servedFrom === "redis" ? "from-redis" : "from-postgres";
-  el.cacheStatus.textContent = trusted ? "trusted" : "fallback";
+  el.servedFrom.className =
+    servedFrom === "redis" || servedFrom === "redis_after_worker_repair"
+      ? "from-redis"
+      : "from-postgres";
+  el.cacheStatus.textContent = trusted ? "trusted" : "repair pending";
   el.cacheStatus.className = trusted ? "from-redis" : "untrusted";
-  el.version.textContent = user.version;
+  el.version.textContent = user.version ?? "pending";
 
   el.avatar.textContent = initials(user.name);
-  el.name.textContent = user.name;
-  el.userId.textContent = user.id;
-  el.phone.textContent = user.phone_number;
-  el.email.textContent = user.email;
+  el.name.textContent = user.name ?? "Repair pending";
+  el.userId.textContent = user.id ?? userId;
+  el.phone.textContent = user.phone_number ?? "pending";
+  el.email.textContent = user.email ?? "pending";
 
-  el.nameInput.value = user.name;
-  el.phoneInput.value = user.phone_number;
+  el.nameInput.value = user.name ?? el.nameInput.value;
+  el.phoneInput.value = user.phone_number ?? el.phoneInput.value;
 }
 
 async function refresh(message = "Profile refreshed.") {
