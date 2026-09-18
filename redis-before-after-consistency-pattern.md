@@ -6,7 +6,7 @@
 
 Every system that caches data in front of a database eventually runs into the same uncomfortable fact: **you cannot write to two systems atomically.** Postgres and Redis don't share a transaction. Somewhere between "write the cache" and "write the database," a crash, a timeout, or a lost network packet can leave the two disagreeing about the truth — and nothing about a normal cache-aside setup tells you when that's happened.
 
-I ran into this while thinking about caching account balances for a payments service, and ended up designing a small pattern that lets the cache *prove* whether it's safe to trust, rather than just hoping it usually is. This post walks through the problem, the pattern (I'm calling it BEFORE/AFTER fencing), the bugs in the naive version of it, and how it compares to the more conventional CDC-based answer to the same problem.
+I ran into this while thinking about caching account balances for a payments service, and ended up designing a small pattern that lets the cache *prove* whether it's safe to trust, rather than just hoping it usually is. This post walks through the problem, the pattern (I'm calling it BEFORE/AFTER fencing), the bugs in the naive design, and how it compares to the more conventional CDC-based answer to the same problem.
 
 ## The dual-write problem, concretely
 
@@ -55,6 +55,37 @@ BEFORE.uuid != AFTER.uuid   →  don't trust it, read Postgres
 
 The UUID tags one specific update attempt. `BEFORE` is only a marker; it never carries the tentative value. `AFTER` is the only place the cached value lives, and it only advances once *that* attempt is confirmed durable by Postgres. If anything goes wrong in between — a rejected write, a crash, a lost process — `AFTER` just never catches up, and the mismatch is itself the signal that something's unresolved. Postgres stays the single source of truth throughout; Redis is only ever allowed to answer when it can prove it reflects a completed Postgres transaction.
 
+The protocol is identified by an opaque **cache key**, not by a particular table
+or entity type. A cache key identifies the complete value protected by the
+fence:
+
+```text
+user:42
+order:99:summary
+account:42:dashboard
+```
+
+The business operation supplies the complete value for that cache key; the
+fencing layer does not need to know how the value was produced.
+
+The database keeps a small attempt-claim table:
+
+```sql
+cache_attempts(
+  cache_key TEXT,
+  attempt_uuid UUID,
+  created_at TIMESTAMP,
+  PRIMARY KEY (cache_key, attempt_uuid)
+)
+```
+
+The attempt row is inserted in the same database transaction as the business
+write. A repairer tries to insert the same `cache_key` and `attempt_uuid` before
+rebuilding the cached value. A unique-key conflict means the original attempt
+already committed; a successful insert means the original attempt did not
+commit and the repairer has claimed that unresolved attempt. This gives the
+repairer a database-backed answer instead of guessing from Redis timing.
+
 ## What BEFORE and AFTER actually mean
 
 Before the example, it's worth being precise about the two names, because they're doing exactly what they say:
@@ -64,24 +95,23 @@ Before the example, it's worth being precise about the two names, because they'r
 
 So `BEFORE` is set at the *start* of a change, and `AFTER` is set at the *end*, only if that change actually landed. As long as those two UUIDs match, every part of the update — in-flight marker, database commit, confirmation — has completed for the *same* attempt, and `AFTER.value` can be trusted. The moment they diverge, you know something in that sequence is incomplete, and you fall back to Postgres until it's resolved.
 
-## Walking through it: updating a user's phone number
+## Walking through it: updating a user's profile
 
 ### Initial state
 
 ```
-Postgres (users table):
-  id = user-42
-  phone_number = "+1-555-0100"
-  version = 1
+Database:
+  user-42 = { name: "Ada", phone: "+1-555-0100" }
 
 Redis (hash key: user:42):
   BEFORE = { uuid: "UUID-A" }
-  AFTER  = { uuid: "UUID-A", value: "+1-555-0100", version: 1 }
+  AFTER  = { uuid: "UUID-A", value: { name: "Ada", phone: "+1-555-0100" } }
 ```
 
-`BEFORE.uuid == AFTER.uuid` → Redis is trusted. Any read of the user's phone number (an SMS-sending job, a profile page) is served straight from cache, no Postgres round-trip needed.
+`BEFORE.uuid == AFTER.uuid` → Redis is trusted. A profile read is served
+straight from cache, with no database round-trip.
 
-### Step 1 — the user asks to change their phone number to `+1-555-0199`
+### Step 1 — the user asks to change their profile
 
 Generate a new UUID for this attempt: `UUID-B`.
 
@@ -89,58 +119,68 @@ Generate a new UUID for this attempt: `UUID-B`.
 
 ```
 Redis: BEFORE = { uuid: "UUID-B" }
-       AFTER  = { uuid: "UUID-A", value: "+1-555-0100", version: 1 }
+       AFTER  = { uuid: "UUID-A", value: { name: "Ada", phone: "+1-555-0100" } }
 ```
 
-At this instant, `UUID-B != UUID-A`. Any request that reads the cache right now — even microseconds after this write — correctly detects the mismatch and falls back to Postgres, which still returns the *old* number, `+1-555-0100`. The new, unconfirmed number is not in Redis at all. This matters concretely here: an SMS 2FA job that fires mid-update should never send a code to a number that was typed in but never actually saved.
+At this instant, `UUID-B != UUID-A`. Any request that reads the cache right
+now detects the mismatch and falls back to the database, which still returns
+the last committed profile. The new, unconfirmed profile is not in Redis.
 
-### Step 3 — attempt the Postgres write, using optimistic concurrency
+### Step 3 — attempt the database write
 
 ```sql
 UPDATE users
-SET phone_number = '+1-555-0199',
-    version = version + 1
-WHERE id = 'user-42'
-  AND version = 1;
+SET name = 'Ada Byron',
+    phone_number = '+1-555-0199'
+WHERE id = 'user-42';
 ```
 
-### Step 4a — if Postgres succeeds (1 row updated, version is now 2)
+### Step 4a — if the database succeeds
 
 Write AFTER, confirming this specific attempt:
 
 ```
 Redis: BEFORE = { uuid: "UUID-B" }
-       AFTER  = { uuid: "UUID-B", value: "+1-555-0199", version: 2 }
+       AFTER  = { uuid: "UUID-B", value: { name: "Ada Byron", phone: "+1-555-0199" } }
 ```
 
 `BEFORE.uuid == AFTER.uuid` again → Redis is trusted, and it now correctly serves `+1-555-0199`.
 
-### Step 4b — if Postgres rejects the write (0 rows updated — e.g. a concurrent update already bumped the version)
+### Step 4b — if the database rejects the write
 
 `AFTER` is simply never touched. Redis is left as:
 
 ```
 BEFORE = { uuid: "UUID-B" }
-AFTER  = { uuid: "UUID-A", value: "+1-555-0100", version: 1 }
+AFTER  = { uuid: "UUID-A", value: { name: "Ada", phone: "+1-555-0100" } }
 ```
 
-The mismatch persists until repair clears the marker. Every read falls through to Postgres, which still correctly holds `+1-555-0100`. The rejected change never leaks into Redis or a served response.
+The mismatch persists until repair clears the marker. Every read falls through
+to the database, which still holds the last committed profile. The rejected
+change never leaks into Redis or a served response.
 
-### Step 4c — if the app crashes right after Postgres commits, but before writing AFTER
+### Step 4c — if the app crashes after the database commits, but before writing AFTER
 
 ```
-Postgres: phone_number = "+1-555-0199"   ← committed
+Database: { name: "Ada Byron", phone: "+1-555-0199" }   ← committed
 Redis:    BEFORE = { uuid: "UUID-B" }
-          AFTER  = { uuid: "UUID-A", value: "+1-555-0100", version: 1 }
+          AFTER  = { uuid: "UUID-A", value: { name: "Ada", phone: "+1-555-0100" } }
 ```
 
-`UUID-B != UUID-A` still holds, so every read correctly falls back to Postgres (which is right, just slower) until a background repair process notices the mismatch and catches Redis up by writing `AFTER = { uuid: "UUID-B", value: "+1-555-0199", version: 2 }`.
+`UUID-B != UUID-A` still holds, so every read correctly falls back to the
+database until repair notices the mismatch and catches Redis up by writing
+`AFTER = { uuid: "UUID-B", value: { name: "Ada Byron", phone: "+1-555-0199" } }`.
 
-In all three branches (success, rejection, crash), the worst possible outcome is a temporary cache miss that costs an extra Postgres read — never an unconfirmed phone number served as if it were confirmed.
+In all three branches (success, rejection, crash), the worst possible outcome
+is a temporary cache miss that costs an extra database read — never an
+unconfirmed profile served as if it were confirmed.
 
-Concurrent updates to the same user are a separate concern, handled entirely by Postgres: if two requests both try to change `user-42`'s phone number at once, both will read `version = 1`, but only one `UPDATE ... WHERE version = 1` can succeed — the other gets zero rows affected and must retry against the new version rather than silently overwrite. Postgres's version column protects against concurrent writes; the UUID fence protects against trusting an *unconfirmed* cache write. They're doing different jobs.
+Concurrent updates to the same user are handled by the database's own
+concurrency controls. The UUID fence protects the cache from an unconfirmed
+write; the database protects the data from conflicting writes. They do
+different jobs.
 
-## The naive version has four gaps — here's how to fix them
+## The naive design has four gaps — here's how to fix them
 
 I want to flag these clearly, because the pattern above sounds airtight in prose and isn't, until you close these gaps.
 
@@ -149,60 +189,69 @@ I want to flag these clearly, because the pattern above sounds airtight in prose
 **2. A delayed AFTER write can clobber a newer, valid one.** Picture this interleaving on the same key:
 
 ```
-t0: Request 1 writes BEFORE(uuid=B), Postgres commits version 2
-t1: Request 2 writes BEFORE(uuid=C), Postgres commits version 3
-t2: Request 2's AFTER write lands first → AFTER = { uuid=C, value=version 3 }   [correct]
-t3: Request 1's delayed AFTER write finally arrives → AFTER = { uuid=B, value=version 2 }   [wrong — overwrites a valid newer state]
+t0: Request 1 writes BEFORE(uuid=B), then commits its update
+t1: Request 2 writes BEFORE(uuid=C), then commits a newer update
+t2: Request 2's AFTER write lands first → AFTER = { uuid=C, value=newer state }   [correct]
+t3: Request 1's delayed AFTER write arrives → AFTER = { uuid=B, value=older state }   [wrong — overwrites a valid newer state]
 ```
 
-This doesn't cause a *wrong answer* (the system just falls back to Postgres on the resulting mismatch), but it does cause unnecessary cache misses under concurrent writes. The fix is to make the AFTER write conditional on version, via a small Lua script:
+This doesn't cause a *wrong answer* (the system just falls back to the
+database on the resulting mismatch), but it does cause unnecessary cache
+misses under concurrent writes. The fix is to make the AFTER write conditional
+on the database's ordering token:
 
-```lua
--- KEYS[1] = cache key
--- ARGV[1] = uuid, ARGV[2] = confirmed value JSON, ARGV[3] = postgres version
-local current = tonumber(redis.call('HGET', KEYS[1], 'confirmed_version') or '0')
-if tonumber(ARGV[3]) > current then
-  redis.call(
-    'HSET', KEYS[1],
-    'after_uuid', ARGV[1],
-    'value', ARGV[2],
-    'confirmed_version', ARGV[3]
-  )
-  return 1
-end
-return 0
+The cache accepts a confirmation when its ordering token is at least as new as
+the token already stored. An older delayed confirmation is rejected. The
+comparison can be implemented atomically alongside the AFTER write.
+
+**3. Repair must prove which attempt it is resolving.** A repairer must not
+read the database and then invent a new matching UUID pair. That could erase a
+newer in-flight `BEFORE` marker. Instead, it uses the cache key and the exact
+UUID currently in `BEFORE`:
+
+```text
+1. Read cache_key and BEFORE = UUID-B from Redis.
+2. Insert (cache_key, UUID-B) into the database attempt table.
+3. If the insert conflicts, the original writer committed its attempt.
+4. If the insert succeeds, the original writer did not commit and repair owns
+   the unresolved attempt.
+5. Read the complete current value for this cache key from the database.
+6. Write AFTER = UUID-B with that value and its database ordering token.
 ```
 
-**3. The repair worker shouldn't scan the whole keyspace.** Running `SCAN` over every key checking for a mismatch doesn't scale past a small dataset. Instead, maintain a `dirty_keys` set: add a key when `BEFORE` is written, remove it once `AFTER` catches up. The worker then only ever touches genuinely inconsistent keys:
-
-```python
-for key in redis.smembers("dirty_keys"):
-    before, after = redis.hmget(key, "before_uuid", "after_uuid")
-    if before == after:
-        redis.srem("dirty_keys", key)
-        continue
-    row = postgres.query("SELECT phone_number, version FROM users WHERE id = %s", extract_id(key))
-    redis.eval(REPAIR_FROM_DB_SCRIPT, 2, key, "dirty_keys",
-               json.dumps(row), new_uuid(), row.version, now_ms())
-```
-
-Note the worker writes through the *same* version-gated script — it must never blindly overwrite, in case the value has moved on again since the key was queued as dirty. The demo also uses a short-lived Redis lease per user for normal API writes, request-triggered repairs, and worker repairs. This coordinates repair work for hot keys and prevents the worker from changing fencing markers during an API update. Other readers briefly wait for the lease holder to restore a trusted cache entry, then fall back to Postgres if the lease expires.
+The repairer writes through the *same* ordering-gated script — it must never
+blindly overwrite, in case the value has moved on again since the key became
+dirty. It confirms the exact `BEFORE` UUID it claimed; it does not invent a new
+matching pair and it never overwrites a newer `BEFORE` marker. A dirty-key
+index, queue, or equivalent notification mechanism can identify repair work;
+that delivery mechanism is separate from the fencing strategy.
 
 **4. A dirty hot key can create a cache stampede.** If many readers see the
-same mismatch, they can all query Postgres at once. The shared per-user lease
-provides singleflight coordination: one request acquires `lock:user:<id>`,
-reads Postgres, and repairs Redis. Other readers briefly poll for a trusted
-cache entry, then fall back to Postgres if the repair does not finish within
-the wait window. Normal API writes and the background worker use the same
-lease, so they cannot repair or update the same key concurrently while the
-lease is valid.
+same mismatch, they can all query Postgres at once. Optional per-cache-key
+singleflight coordination lets one reader perform the repair while the others
+briefly wait for a trusted value, then fall back to the database if the repair
+does not finish within the wait window. This reduces load; it is not the
+correctness mechanism. The database attempt claim and Redis ordering check still
+protect correctness if multiple repairers or a writer race.
 
 ## What this does and doesn't cover
 
-With the four protections in place, the pattern guarantees Redis is never served as authoritative unless it demonstrably reflects a committed Postgres write, and that crashes, rejected writes, and races all degrade into cache misses rather than wrong answers. The request path may wait briefly for the repair lease, but it does not wait indefinitely for the worker: it falls back to Postgres when the wait window expires.
+With the four protections in place, the pattern guarantees Redis is never
+served as authoritative unless it demonstrably reflects a committed database
+write, and that crashes, rejected writes, and races all degrade into cache
+misses rather than wrong answers. A request may wait briefly for repair, but it
+does not wait indefinitely; it falls back to the database when the wait window
+expires.
 
-It does *not* cover everything on its own. Redis failing over mid-write (Sentinel/Cluster) can still lose a `BEFORE` or `AFTER` write independently — the fallback behavior absorbs this, but it's worth deliberately testing (kill Redis, kill the app, kill the worker, check nothing corrupted gets served). A repair worker that's down for a long stretch can leave a key permanently mismatched, so a safety TTL is worth adding. The repair lease reduces the cache-stampede risk, but lease expiry or a database operation that outlives the lease can still cause extra Postgres reads, so lease duration and fallback volume should be monitored. And it's worth instrumenting the mismatch-driven cache-miss rate separately from ordinary TTL misses, so you can tell whether the cache is actually doing its job under real write load or just constantly falling back.
+It does *not* cover everything on its own. Redis failing over mid-write
+(Sentinel/Cluster) can still lose a `BEFORE` or `AFTER` write independently —
+the fallback behavior absorbs this, but it is worth testing deliberately. A
+repair process that is down for a long stretch can leave a key permanently
+mismatched, so attempt retention, dirty-key age, and repair health need
+monitoring. Singleflight reduces stampede risk but does not eliminate database
+fallbacks when repair is slow. It is also worth instrumenting mismatch-driven
+cache misses separately from ordinary TTL misses.
 
 ## Where this leaves you
 
-If you're already running a CDC pipeline, that's still the cleaner long-term answer — one write path, no dual-write race by construction. If you're not, and you want a way to make a Redis-in-front-of-Postgres setup provably safe without adopting new infrastructure, BEFORE/AFTER fencing is a reasonably small, self-contained way to get there. It trades a bit of write-path complexity (an atomic hash, a version-gated confirm, a dirty set) for the guarantee that matters most: **the cache is either provably right, or it says so.**
+If you're already running a CDC pipeline, that's still the cleaner long-term answer — one write path, no dual-write race by construction. If you're not, and you want a way to make a Redis-in-front-of-Postgres setup provably safe without adopting new infrastructure, BEFORE/AFTER fencing is a reasonably small, self-contained way to get there. It trades a bit of write-path complexity (an atomic hash, an ordering-gated confirm, a dirty set) for the guarantee that matters most: **the cache is either provably right, or it says so.**
