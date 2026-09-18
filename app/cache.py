@@ -8,6 +8,15 @@ from typing import Any
 from redis.asyncio import Redis
 
 from app.settings import DIRTY_KEYS_SET
+from app.settings import SINGLEFLIGHT_TTL_MS
+
+
+LOCK_RELEASE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 WRITE_BEFORE_SCRIPT = """
@@ -45,8 +54,12 @@ return 0
 """
 
 
-def cache_key(user_id: str) -> str:
+def user_cache_key(user_id: str) -> str:
     return f"user:{user_id}"
+
+
+def singleflight_key(cache_key_value: str, attempt_uuid: str) -> str:
+    return f"repair:singleflight:{cache_key_value}:{attempt_uuid}"
 
 
 def user_id_from_cache_key(key: str) -> str:
@@ -67,16 +80,48 @@ async def create_redis(redis_url: str) -> Redis:
     return Redis.from_url(redis_url, decode_responses=True)
 
 
+async def acquire_singleflight(
+    redis: Redis,
+    cache_key_value: str,
+    attempt_uuid: str,
+    owner_token: str,
+    ttl_ms: int = SINGLEFLIGHT_TTL_MS,
+) -> bool:
+    return bool(
+        await redis.set(
+            singleflight_key(cache_key_value, attempt_uuid),
+            owner_token,
+            nx=True,
+            px=ttl_ms,
+        )
+    )
+
+
+async def release_singleflight(
+    redis: Redis,
+    cache_key_value: str,
+    attempt_uuid: str,
+    owner_token: str,
+) -> bool:
+    released = await redis.eval(
+        LOCK_RELEASE_SCRIPT,
+        1,
+        singleflight_key(cache_key_value, attempt_uuid),
+        owner_token,
+    )
+    return bool(released)
+
+
 async def write_before(
     redis: Redis,
-    user_id: str,
+    cache_key_value: str,
     attempt_uuid: str,
 ) -> int:
     return int(
         await redis.eval(
             WRITE_BEFORE_SCRIPT,
             2,
-            cache_key(user_id),
+            cache_key_value,
             DIRTY_KEYS_SET,
             attempt_uuid,
             str(now_ms()),
@@ -86,71 +131,71 @@ async def write_before(
 
 async def confirm_after(
     redis: Redis,
-    user_id: str,
+    cache_key_value: str,
     attempt_uuid: str,
-    user: dict[str, Any],
-    postgres_version: int,
+    value: dict[str, Any],
+    database_version: int,
 ) -> int:
     return int(
         await redis.eval(
             CONFIRM_AFTER_SCRIPT,
             2,
-            cache_key(user_id),
+            cache_key_value,
             DIRTY_KEYS_SET,
             attempt_uuid,
-            encode_user(user),
-            str(postgres_version),
+            encode_value(value),
+            str(database_version),
         )
     )
 
 
 async def repair_from_db(
     redis: Redis,
-    user_id: str,
+    cache_key_value: str,
     attempt_uuid: str,
-    user: dict[str, Any],
-    postgres_version: int,
+    value: dict[str, Any],
+    database_version: int,
 ) -> int:
-    return await confirm_after(redis, user_id, attempt_uuid, user, postgres_version)
+    return await confirm_after(redis, cache_key_value, attempt_uuid, value, database_version)
 
 
 async def set_trusted(
     redis: Redis,
-    user_id: str,
-    user: dict[str, Any],
-    postgres_version: int,
+    cache_key_value: str,
+    value: dict[str, Any],
+    database_version: int,
 ) -> None:
     attempt_uuid = new_uuid()
     await redis.hset(
-        cache_key(user_id),
+        cache_key_value,
         mapping={
-            "value": encode_user(user),
+            "value": encode_value(value),
             "before_uuid": attempt_uuid,
             "after_uuid": attempt_uuid,
-            "confirmed_version": postgres_version,
+            "confirmed_version": database_version,
             "before_written_at_ms": now_ms(),
         },
     )
-    await redis.srem(DIRTY_KEYS_SET, cache_key(user_id))
+    await redis.srem(DIRTY_KEYS_SET, cache_key_value)
 
 
-async def get_cache(redis: Redis, user_id: str) -> dict[str, Any]:
-    data = await redis.hgetall(cache_key(user_id))
+async def get_cache(redis: Redis, cache_key_value: str) -> dict[str, Any]:
+    data = await redis.hgetall(cache_key_value)
     return normalize_cache(data)
 
 
-def encode_user(user: dict[str, Any]) -> str:
-    return json.dumps(user, separators=(",", ":"), sort_keys=True)
+def encode_value(value: dict[str, Any]) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
 
 
-def decode_user(value: str) -> dict[str, Any]:
+def decode_value(value: str) -> dict[str, Any]:
     return json.loads(value)
 
 
 def normalize_cache(data: dict[str, str]) -> dict[str, Any]:
     normalized: dict[str, Any] = dict(data)
     if "value" in normalized:
-        normalized["value"] = decode_user(normalized["value"])
+        normalized["value"] = decode_value(normalized["value"])
     for field in ("confirmed_version", "before_written_at_ms"):
         if field in normalized:
             normalized[field] = int(normalized[field])

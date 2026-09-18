@@ -240,6 +240,7 @@ Real app endpoints:
 
 ```text
 GET   /users/{user_id}
+GET   /users/{user_id}/singleflight
 PATCH /users/{user_id}
 ```
 
@@ -284,15 +285,39 @@ The delayed confirmation case is protected by `confirmed_version`: Redis only
 accepts an `AFTER` write if its Postgres version is newer than the current
 confirmed version.
 
+## Keeping Cache Code Out Of Business Logic
+
+Application code supplies a database callback to `CacheCoordinator`. The
+callback contains only the business update; the coordinator owns UUID creation,
+the Redis `BEFORE` marker, the database attempt claim, the Redis `AFTER` write,
+and repair scheduling:
+
+```python
+result = await cache_coordinator.cached_write(
+    cache_key="user:42",
+    write_db=lambda conn: update_user_in_tx(
+        conn, user_id, name, phone_number, expected_version
+    ),
+)
+```
+
+An aggregate uses its own opaque key, for example
+`cache_key="order:99:summary"`, and its callback can update multiple tables and
+return the complete aggregate value.
+
+The cache layer does not require a business-specific `expected_version`. If a
+business operation needs optimistic concurrency, it keeps that rule inside its
+callback. The same coordinator exposes worker-backed reads and an optional
+singleflight read route, so business handlers do not need to manipulate Redis
+markers directly.
+
 ## Worker
 
-The worker scans Redis `dirty_keys`, reads the current row from Postgres, and
-repairs untrusted cache entries using the same version-gated Redis script.
-The API and worker coordinate through a short-lived per-user Redis lease. The
-lease covers normal writes and repairs, so a worker cannot repair a key while
-an API update is changing its fencing markers. If several requests encounter
-the same dirty key, one request repairs it while the others briefly wait for a
-trusted cache entry before falling back to Postgres.
+The worker consumes deduplicated BullMQ repair jobs, reads the current row from
+Postgres, and repairs untrusted cache entries using the same version-gated Redis
+script. The API and worker do not need to share a long-lived lock: the database
+attempt row decides which repair or writer owns a UUID, while Redis version
+gating prevents an older confirmation from overwriting a newer value.
 
 The worker interval is intentionally slow in the demo so you have time to see
 the fallback behavior. Use **Repair once** in the UI when you want to repair
@@ -301,32 +326,33 @@ immediately.
 ## Singleflight Coordination
 
 Fencing prevents an unsafe Redis read, but many simultaneous reads of the same
-dirty key could still overload Postgres. The demo limits that work with a
-short-lived Redis lease per user:
+dirty key could still overload Postgres. The optional
+`GET /users/{user_id}/singleflight` route limits that work with a short-lived
+Redis singleflight lock per dirty attempt:
 
 ```text
-1. One request acquires lock:user:42.
+1. One request acquires a lock for user:42 and its current BEFORE UUID.
 2. It reads Postgres and repairs Redis.
 3. Other requests briefly wait for Redis to become trusted.
 4. They serve the repaired value from Redis, or fall back to Postgres after
    the wait period.
 ```
 
-Normal API writes, request-triggered repairs, and background worker repairs all
-use the same lease. This prevents a worker from changing a key while an API
-update is between its `BEFORE` and `AFTER` steps. The lease has an owner token,
-is released atomically, and expires automatically if its owner crashes.
+This is a load-reduction mechanism for concurrent reads, not the correctness
+mechanism. If the singleflight owner crashes, the lock expires and another
+request can retry. The database attempt row and Redis version gate remain the
+source of correctness, including when a worker and a direct repair race.
 
 The defaults are suitable for the demo:
 
 ```text
-USER_LOCK_TTL_MS=5000   lock lifetime
-USER_LOCK_WAIT_MS=300   reader/writer wait time
+SINGLEFLIGHT_TTL_MS=5000   singleflight lock lifetime
+REPAIR_WAIT_MS=600         time followers wait for repair
 ```
 
 These settings are coordination controls, not correctness controls. UUID
-matching, database versions, and Postgres remain responsible for deciding
-whether a cached value is safe.
+matching, database attempt claims, and database versions remain responsible for
+deciding whether a cached value is safe.
 
 ## How This Compares To Outbox/CDC
 
@@ -372,11 +398,11 @@ Postgres a single atomic system.
   commit is safe because reads fall back to Postgres, but the cache may remain
   cold for that key until the worker catches up. Production systems should
   monitor dirty-key age and mismatch-driven cache misses.
-- **The repair lease is best-effort coordination.** A short lease reduces
-  cache stampedes and coordinates API repairs with the worker, but it is not a
-  replacement for the UUID and version checks. Production systems should size
-  the lease for their database latency, handle lease expiry, and monitor
-  fallback volume for hot keys.
+- **Singleflight is best-effort coordination.** The short Redis lock reduces
+  cache stampedes for concurrent reads, but it is not a replacement for the
+  database attempt claim and version checks. Production systems should size the
+  lock for their database latency, handle expiry, and monitor fallback volume
+  for hot keys.
 
 If you already run CDC or an outbox pipeline, that is often the cleaner
 long-term architecture: one write path into Postgres, then asynchronous cache

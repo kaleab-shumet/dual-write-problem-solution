@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,8 @@ from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 
 from app import cache, db
-from app.settings import DATABASE_URL, REDIS_URL, REPAIR_QUEUE_NAME, REPAIR_WAIT_MS
+from app.cache_coordinator import CacheCoordinator
+from app.settings import DATABASE_URL, REDIS_URL, REPAIR_QUEUE_NAME
 
 
 class UserPatchRequest(BaseModel):
@@ -33,6 +33,7 @@ class AppState:
     db_pool: asyncpg.Pool
     redis: Redis
     repair_queue: Queue
+    cache_coordinator: CacheCoordinator
 
 
 @asynccontextmanager
@@ -40,6 +41,11 @@ async def lifespan(app: FastAPI):
     app.state.db_pool = await db.create_pool(DATABASE_URL)
     app.state.redis = await cache.create_redis(REDIS_URL)
     app.state.repair_queue = Queue(REPAIR_QUEUE_NAME, {"connection": REDIS_URL})
+    app.state.cache_coordinator = CacheCoordinator(
+        app.state.db_pool,
+        app.state.redis,
+        app.state.repair_queue,
+    )
     await db.init_db(app.state.db_pool)
     await reset_demo_state(app.state.db_pool, app.state.redis)
     yield
@@ -66,8 +72,12 @@ def redis() -> Redis:
     return app.state.redis
 
 
-def repair_queue() -> Queue:
-    return app.state.repair_queue
+def user_cache_key(user_id: str) -> str:
+    return cache.user_cache_key(user_id)
+
+
+def coordinator() -> CacheCoordinator:
+    return app.state.cache_coordinator
 
 
 def row_to_dict(row: asyncpg.Record | None) -> dict[str, Any] | None:
@@ -77,7 +87,7 @@ def row_to_dict(row: asyncpg.Record | None) -> dict[str, Any] | None:
 async def snapshot(user_id: str = "42") -> dict[str, Any]:
     return {
         "postgres": row_to_dict(await db.get_user(pool(), user_id)),
-        "redis": await cache.get_cache(redis(), user_id),
+        "redis": await cache.get_cache(redis(), user_cache_key(user_id)),
         "dirty_keys": await cache.dirty_keys(redis()),
     }
 
@@ -87,7 +97,7 @@ async def reset_demo_state(db_pool: asyncpg.Pool, redis_client: Redis) -> dict[s
     row = await db.reset_user(db_pool, "42")
     return {
         "postgres": row_to_dict(row),
-        "redis": await cache.get_cache(redis_client, row["id"]),
+        "redis": await cache.get_cache(redis_client, user_cache_key(row["id"])),
         "dirty_keys": await cache.dirty_keys(redis_client),
     }
 
@@ -101,34 +111,9 @@ async def current_expected_version(user_id: str, explicit: int | None) -> int:
     return int(row["version"])
 
 
-def repair_job_id(user_id: str, before_uuid: str) -> str:
-    return f"repair-user-{user_id}-{before_uuid}"
-
-
-async def enqueue_repair(user_id: str, before_uuid: str) -> str:
-    job_id = repair_job_id(user_id, before_uuid)
-    await repair_queue().add(
-        "repair-user-cache",
-        {
-            "entity_type": "user",
-            "entity_id": user_id,
-            "before_uuid": before_uuid,
-        },
-        {
-            "jobId": job_id,
-            "deduplication": {"id": job_id},
-            "attempts": 5,
-            "backoff": {"type": "exponential", "delay": 100},
-            "removeOnComplete": {"age": 60},
-            "removeOnFail": {"age": 300},
-        },
-    )
-    return job_id
-
-
 async def repair_one_key(key: str) -> dict[str, Any]:
     user_id = cache.user_id_from_cache_key(key)
-    cached = await cache.get_cache(redis(), user_id)
+    cached = await cache.get_cache(redis(), key)
     before_uuid = cached.get("before_uuid")
     if cached.get("trusted"):
         await cache.remove_dirty(redis(), key)
@@ -136,26 +121,19 @@ async def repair_one_key(key: str) -> dict[str, Any]:
     if not before_uuid:
         return {"key": key, "action": "missing_before_uuid"}
 
-    row, db_action = await db.repair_user_for_attempt(pool(), user_id, before_uuid)
-    if row is None:
+    repaired = await coordinator().repair_attempt(
+        key,
+        before_uuid,
+        lambda: db.get_user(pool(), user_id),
+    )
+    if repaired.get("value") is None:
         return {"key": key, "action": "missing_postgres_row"}
-    repaired = await cache.repair_from_db(redis(), user_id, before_uuid, dict(row), row["version"])
     return {
         "key": key,
         "action": "repaired_after_from_db",
-        "db_action": db_action,
-        "confirm_result": repaired,
+        "db_action": repaired.get("db_action"),
+        "confirm_result": repaired.get("confirm_result"),
     }
-
-
-async def wait_for_trusted_cache(user_id: str) -> dict[str, Any] | None:
-    attempts = max(1, REPAIR_WAIT_MS // 30)
-    for _ in range(attempts):
-        cached = await cache.get_cache(redis(), user_id)
-        if cached.get("trusted"):
-            return cached
-        await asyncio.sleep(0.03)
-    return None
 
 
 @app.get("/")
@@ -191,48 +169,34 @@ async def reset_demo() -> dict[str, Any]:
 
 @app.get("/users/{user_id}")
 async def read_user(user_id: str) -> dict[str, Any]:
-    cached = await cache.get_cache(redis(), user_id)
-    if cached.get("trusted"):
-        return {
-            "served_from": "redis",
-            "trusted_cache": True,
-            "user": cached["value"],
-            "debug": await snapshot(user_id),
-        }
-
-    before_uuid = cached.get("before_uuid")
-    if before_uuid:
-        job_id = await enqueue_repair(user_id, before_uuid)
-        repaired_cache = await wait_for_trusted_cache(user_id)
-        if repaired_cache:
-            return {
-                "served_from": "redis_after_worker_repair",
-                "trusted_cache": True,
-                "repair_job_id": job_id,
-                "user": repaired_cache["value"],
-                "debug": await snapshot(user_id),
-            }
-        return JSONResponse(
-            status_code=202,
-            content={
-                "served_from": "repair_pending",
-                "trusted_cache": False,
-                "repair_job_id": job_id,
-                "user": None,
-                "debug": await snapshot(user_id),
-            },
-        )
-
-    row = await db.get_user(pool(), user_id)
-    if row is None:
+    result = await coordinator().read_with_worker(
+        user_cache_key(user_id),
+        lambda: db.get_user(pool(), user_id),
+    )
+    if result.get("served_from") == "missing":
         raise HTTPException(status_code=404, detail=f"user {user_id} not found")
-    await cache.set_trusted(redis(), user_id, dict(row), row["version"])
-    return {
-        "served_from": "postgres",
-        "trusted_cache": True,
-        "user": row_to_dict(row),
-        "debug": await snapshot(user_id),
-    }
+    result["user"] = result.pop("value")
+    result["debug"] = await snapshot(user_id)
+    status_code = result.pop("status_code", None)
+    if status_code:
+        return JSONResponse(status_code=status_code, content=result)
+    return result
+
+
+@app.get("/users/{user_id}/singleflight")
+async def read_user_with_singleflight(user_id: str) -> dict[str, Any]:
+    result = await coordinator().read_with_singleflight(
+        user_cache_key(user_id),
+        lambda: db.get_user(pool(), user_id),
+    )
+    if result.get("served_from") == "missing":
+        raise HTTPException(status_code=404, detail=f"user {user_id} not found")
+    result["user"] = result.pop("value")
+    result["debug"] = await snapshot(user_id)
+    status_code = result.pop("status_code", None)
+    if status_code:
+        return JSONResponse(status_code=status_code, content=result)
+    return result
 
 
 @app.patch("/users/{user_id}")
@@ -245,21 +209,21 @@ async def update_user(user_id: str, body: UserPatchRequest) -> dict[str, Any]:
     if current is None:
         raise HTTPException(status_code=404, detail=f"user {user_id} not found")
 
-    attempt_uuid = cache.new_uuid()
-    await cache.write_before(redis(), user_id, attempt_uuid)
-    row = await db.update_user_with_attempt(
-        pool(),
-        user_id,
-        attempt_uuid,
-        body.name,
-        body.phone_number,
-        expected_version,
+    result = await coordinator().cached_write(
+        user_cache_key(user_id),
+        lambda conn: db.update_user_in_tx(
+            conn,
+            user_id,
+            body.name,
+            body.phone_number,
+            expected_version,
+        ),
     )
-    if row is None:
-        await enqueue_repair(user_id, attempt_uuid)
-        return {"outcome": "postgres_rejected_write_or_attempt_lost", "why_it_is_safe": "AFTER was not written, so Redis remains untrusted until the worker confirms this UUID.", "debug": await snapshot(user_id)}
-    confirm_result = await cache.confirm_after(redis(), user_id, attempt_uuid, dict(row), row["version"])
-    return {"outcome": "committed_and_confirmed", "attempt_uuid": attempt_uuid, "confirm_result": confirm_result, "user": row_to_dict(row), "debug": await snapshot(user_id)}
+    result["user"] = result.pop("value")
+    if result["user"] is None:
+        result["why_it_is_safe"] = "AFTER was not written, so Redis remains untrusted until the worker confirms this UUID."
+    result["debug"] = await snapshot(user_id)
+    return result
 
 
 @app.post("/demo/rejected-write")
@@ -273,21 +237,20 @@ async def rejected_write(
     if row is None:
         raise HTTPException(status_code=404, detail="user 42 not found")
     stale_version = max(int(row["version"]) - 1, 0)
-    attempt_uuid = cache.new_uuid()
-    await cache.write_before(redis(), "42", attempt_uuid)
-    rejected = await db.update_user_with_attempt(
-        pool(),
-        "42",
-        attempt_uuid,
-        body.name,
-        body.phone_number,
-        stale_version,
+    result = await coordinator().cached_write(
+        user_cache_key("42"),
+        lambda conn: db.update_user_in_tx(
+            conn,
+            "42",
+            body.name,
+            body.phone_number,
+            stale_version,
+        ),
     )
-    await enqueue_repair("42", attempt_uuid)
     return {
         "outcome": "postgres_rejected_write",
-        "attempt_uuid": attempt_uuid,
-        "postgres_returned_row": row_to_dict(rejected),
+        "attempt_uuid": result["attempt_uuid"],
+        "postgres_returned_row": result["value"],
         "why_it_is_safe": "The rejected DB transaction rolled back its attempt insert. The worker can claim the same BEFORE UUID and confirm the still-current DB row.",
         "debug": await snapshot("42"),
     }
@@ -301,24 +264,25 @@ async def crash_after_db_commit(
     current = await db.get_user(pool(), "42")
     if current is None:
         raise HTTPException(status_code=404, detail="user 42 not found")
-    attempt_uuid = cache.new_uuid()
-    await cache.write_before(redis(), "42", attempt_uuid)
-    row = await db.update_user_with_attempt(
-        pool(),
-        "42",
-        attempt_uuid,
-        body.name,
-        body.phone_number,
-        expected_version,
+    result = await coordinator().cached_write(
+        user_cache_key("42"),
+        lambda conn: db.update_user_in_tx(
+            conn,
+            "42",
+            body.name,
+            body.phone_number,
+            expected_version,
+        ),
+        confirm_after=False,
+        enqueue_repair_after_commit=True,
     )
-    if row is None:
+    if result["value"] is None:
         return {"outcome": "postgres_rejected_write_or_attempt_lost", "debug": await snapshot("42")}
-    await enqueue_repair("42", attempt_uuid)
     return {
         "outcome": "simulated_crash_after_postgres_commit",
-        "attempt_uuid": attempt_uuid,
+        "attempt_uuid": result["attempt_uuid"],
         "important_part": "The API intentionally did not write AFTER. The worker will try the same BEFORE UUID; duplicate means the DB transaction committed, so it repairs from the committed row.",
-        "user": row_to_dict(row),
+        "user": result["value"],
         "debug": await snapshot("42"),
     }
 
@@ -336,40 +300,46 @@ async def delayed_after_race(
 
     starting_version = int(row["version"])
 
-    uuid_b = cache.new_uuid()
-    await cache.write_before(redis(), "42", uuid_b)
-    row_b = await db.update_user_with_attempt(
-        pool(),
-        "42",
-        uuid_b,
-        body.name,
-        body.phone_number,
-        starting_version,
+    first = await coordinator().cached_write(
+        user_cache_key("42"),
+        lambda conn: db.update_user_in_tx(
+            conn,
+            "42",
+            body.name,
+            body.phone_number,
+            starting_version,
+        ),
+        confirm_after=False,
     )
-    if row_b is None:
+    if first["value"] is None:
         raise HTTPException(status_code=409, detail="first simulated update failed")
 
-    uuid_c = cache.new_uuid()
-    await cache.write_before(redis(), "42", uuid_c)
-    row_c = await db.update_user_with_attempt(
-        pool(),
-        "42",
-        uuid_c,
-        body.name,
-        body.phone_number,
-        starting_version + 1,
+    second = await coordinator().cached_write(
+        user_cache_key("42"),
+        lambda conn: db.update_user_in_tx(
+            conn,
+            "42",
+            body.name,
+            body.phone_number,
+            starting_version + 1,
+        ),
     )
-    if row_c is None:
+    if second["value"] is None:
         raise HTTPException(status_code=409, detail="second simulated update failed")
 
-    confirm_c = await cache.confirm_after(redis(), "42", uuid_c, dict(row_c), row_c["version"])
-    delayed_confirm_b = await cache.confirm_after(redis(), "42", uuid_b, dict(row_b), row_b["version"])
+    delayed_confirm_b = await cache.confirm_after(
+        redis(),
+        user_cache_key("42"),
+        first["attempt_uuid"],
+        first["value"],
+        first["value"]["version"],
+    )
 
     return {
         "outcome": "newer_confirm_won",
-        "first_update": {"uuid": uuid_b, "version": row_b["version"]},
-        "second_update": {"uuid": uuid_c, "version": row_c["version"]},
-        "confirm_second_result": confirm_c,
+        "first_update": {"uuid": first["attempt_uuid"], "version": first["value"]["version"]},
+        "second_update": {"uuid": second["attempt_uuid"], "version": second["value"]["version"]},
+        "confirm_second_result": second["confirm_result"],
         "delayed_confirm_first_result": delayed_confirm_b,
         "why_it_is_safe": "The late AFTER for the older version returned 0 and could not clobber the newer confirmed cache.",
         "debug": await snapshot("42"),

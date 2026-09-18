@@ -8,6 +8,7 @@ from typing import Any
 from bullmq import Worker
 
 from app import cache, db
+from app.cache_coordinator import CacheCoordinator
 from app.settings import DATABASE_URL, REDIS_URL, REPAIR_QUEUE_NAME
 
 
@@ -16,16 +17,14 @@ logger = logging.getLogger("repair-worker")
 
 
 async def repair_user(
-    db_pool,
+    coordinator: CacheCoordinator,
     redis,
-    entity_type: str,
-    entity_id: str,
+    cache_key: str,
     before_uuid: str,
 ) -> dict[str, Any]:
-    if entity_type != "user":
-        raise ValueError(f"Unsupported entity_type: {entity_type}")
+    user_id = cache.user_id_from_cache_key(cache_key)
 
-    cached = await cache.get_cache(redis, entity_id)
+    cached = await cache.get_cache(redis, cache_key)
     if cached.get("trusted") or cached.get("before_uuid") != before_uuid:
         return {
             "action": "skipped_cache_already_moved",
@@ -33,37 +32,34 @@ async def repair_user(
             "current_before_uuid": cached.get("before_uuid"),
         }
 
-    row, db_action = await db.repair_user_for_attempt(db_pool, entity_id, before_uuid)
-    if row is None:
-        return {"action": "missing_postgres_row", "db_action": db_action}
-
-    confirm_result = await cache.repair_from_db(
-        redis,
-        entity_id,
+    repaired = await coordinator.repair_attempt(
+        cache_key,
         before_uuid,
-        dict(row),
-        row["version"],
+        lambda: db.get_user(coordinator.db_pool, user_id),
     )
+    if repaired.get("value") is None:
+        return {"action": "missing_postgres_row", "db_action": repaired.get("db_action")}
+
     return {
         "action": "repaired_after_from_db",
-        "db_action": db_action,
-        "confirm_result": confirm_result,
-        "version": row["version"],
+        "db_action": repaired.get("db_action"),
+        "confirm_result": repaired.get("confirm_result"),
+        "version": repaired["value"]["version"],
     }
 
 
 async def main() -> None:
     db_pool = await db.create_pool(DATABASE_URL)
     redis = await cache.create_redis(REDIS_URL)
+    coordinator = CacheCoordinator(db_pool, redis)
     await db.init_db(db_pool)
 
     async def process(job, job_token):
         data = job.data
         result = await repair_user(
-            db_pool,
+            coordinator,
             redis,
-            data["entity_type"],
-            data["entity_id"],
+            data["cache_key"],
             data["before_uuid"],
         )
         logger.info("processed repair job %s: %s", job.id, result)
