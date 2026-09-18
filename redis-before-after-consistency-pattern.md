@@ -82,9 +82,15 @@ cache_attempts(
 The attempt row is inserted in the same database transaction as the business
 write. A repairer tries to insert the same `cache_key` and `attempt_uuid` before
 rebuilding the cached value. A unique-key conflict means the original attempt
-already committed; a successful insert means the original attempt did not
-commit and the repairer has claimed that unresolved attempt. This gives the
-repairer a database-backed answer instead of guessing from Redis timing.
+has already been claimed by another transaction; in the writer/repair race,
+that means the original writer committed. A successful insert means the
+repairer has claimed the unresolved attempt. This gives the repairer a
+database-backed answer instead of guessing from Redis timing.
+
+This depends on transactional unique-constraint behavior: an insert that races
+with an uncommitted insert for the same key must wait for that transaction to
+commit or roll back, then report the correct result. The exact behavior should
+be verified for the chosen database engine.
 
 ## What BEFORE and AFTER actually mean
 
@@ -110,6 +116,10 @@ Redis (hash key: user:42):
 
 `BEFORE.uuid == AFTER.uuid` → Redis is trusted. A profile read is served
 straight from cache, with no database round-trip.
+
+If Redis is empty, the first read goes to the database, stores the returned
+value with a newly generated UUID in both BEFORE and AFTER, and then serves that
+value. The cache starts trusted only after the database read succeeds.
 
 ### Step 1 — the user asks to change their profile
 
@@ -180,6 +190,154 @@ concurrency controls. The UUID fence protects the cache from an unconfirmed
 write; the database protects the data from conflicting writes. They do
 different jobs.
 
+## Every important case, as a timeline
+
+The following timelines use these short names:
+
+```text
+A = the currently committed database value
+B = a new update attempt with UUID-B
+C = a later update attempt with UUID-C
+```
+
+### Empty cache
+
+```text
+t0  Redis has no entry.
+t1  A read goes to the database and receives A.
+t2  Redis stores BEFORE=UUID-A and AFTER=UUID-A with value A.
+t3  The read returns A; later reads can trust Redis.
+```
+
+### Normal successful write
+
+```text
+t0  Redis: BEFORE=A, AFTER=A, value=A             trusted
+t1  Writer creates UUID-B and writes BEFORE=B.     untrusted
+t2  Writer inserts (cache_key, B) and updates the database in one transaction.
+t3  The transaction commits with value B.
+t4  Writer writes AFTER=B with value B.
+t5  BEFORE=B and AFTER=B.                         trusted
+```
+
+### Database rejects the write
+
+```text
+t0  Redis: BEFORE=A, AFTER=A, value=A             trusted
+t1  Writer writes BEFORE=B.                       untrusted
+t2  Writer inserts (cache_key, B), but the business write is rejected.
+t3  The transaction rolls back, including the attempt row.
+t4  Redis remains BEFORE=B, AFTER=A.               untrusted
+t5  Repair inserts (cache_key, B) successfully.
+t6  Repair reads the current database value A and writes AFTER=B, value A.
+t7  BEFORE=B and AFTER=B.                         trusted with the real value A
+```
+
+### Application crashes before reaching the database
+
+```text
+t0  Writer writes BEFORE=B.
+t1  The application crashes before opening or committing a database transaction.
+t2  Redis remains BEFORE=B, AFTER=A.               untrusted
+t3  Repair inserts (cache_key, B) successfully.
+t4  Repair reads A and writes AFTER=B, value A.
+t5  BEFORE=B and AFTER=B.                         trusted
+```
+
+### Application crashes during an uncommitted database transaction
+
+```text
+t0  Writer writes BEFORE=B.
+t1  Writer inserts (cache_key, B) and starts the business update.
+t2  Repair tries to insert (cache_key, B) and waits for the writer transaction.
+t3  The writer crashes; the database rolls back the transaction.
+t4  Repair's insert succeeds after the rollback.
+t5  Repair reads A and writes AFTER=B, value A.
+t6  BEFORE=B and AFTER=B.                         trusted
+```
+
+### Application crashes after database commit but before AFTER
+
+```text
+t0  Writer writes BEFORE=B.
+t1  Writer inserts (cache_key, B) and updates the database to B.
+t2  The database transaction commits.
+t3  The application crashes before writing AFTER.
+t4  Redis remains BEFORE=B, AFTER=A.               untrusted
+t5  Repair tries to insert (cache_key, B) and gets a unique conflict.
+t6  Repair reads the committed database value B.
+t7  Repair writes AFTER=B, value B.
+t8  BEFORE=B and AFTER=B.                         trusted
+```
+
+### Repair claims before a slow writer reaches the database
+
+```text
+t0  Writer creates UUID-B and writes BEFORE=B.
+t1  Writer pauses before its database transaction starts.
+t2  Repair inserts (cache_key, B) successfully and claims the attempt.
+t3  Repair reads A and writes AFTER=B, value A.
+t4  Writer starts its transaction and tries to insert (cache_key, B).
+t5  The unique conflict rejects the writer transaction before its business
+    update can commit.
+t6  Redis remains BEFORE=B, AFTER=B, value A.     trusted
+```
+
+The attempted update does not appear in the database because repair claimed its
+UUID first.
+
+### Writer claims before repair
+
+```text
+t0  Writer writes BEFORE=B.
+t1  Writer inserts (cache_key, B) and starts the database transaction.
+t2  Repair tries to insert (cache_key, B) and waits.
+t3a Writer commits: repair receives a conflict, reads B, and writes AFTER=B.
+t3b Writer rolls back: repair's insert succeeds, reads A, and writes AFTER=B.
+t4  In either branch, Redis is trusted only with the value the database says
+    is current.
+```
+
+### Two writers race and an old AFTER arrives late
+
+```text
+t0  Writer 1 writes BEFORE=B and begins its database update.
+t1  Writer 2 writes BEFORE=C and begins a later database update.
+t2  The database's concurrency rules decide which writes commit and which
+    writes must retry or roll back.
+t3  A newer confirmed AFTER=C reaches Redis first.
+t4  The delayed AFTER=B arrives later.
+t5  The ordering check rejects the older confirmation, so value C remains.
+```
+
+If the ordering check is unavailable, the cache may become untrusted and fall
+back to the database, but it should not claim that an older confirmation is
+newer than the state already confirmed.
+
+### Redis fails before BEFORE is recorded
+
+```text
+t0  The writer cannot record BEFORE.
+t1  The writer must not continue with the database write.
+t2  No database change occurs and the previous cache state remains valid.
+```
+
+### Redis fails after the database commits but before AFTER is recorded
+
+```text
+t0  BEFORE=B is recorded.
+t1  The database transaction commits value B.
+t2  The AFTER write fails.
+t3  Redis remains untrusted, or the entry is unavailable.
+t4  A later repair reads the database and confirms the cache with B.
+```
+
+Redis failover is a separate operational boundary. If a failover loses an
+acknowledged BEFORE write while retaining an older matching AFTER, Redis could
+appear trusted with stale data. The pattern cannot prevent that kind of data
+loss by itself; Redis durability and failover behavior must be configured and
+tested separately.
+
 ## The naive design has four gaps — here's how to fix them
 
 I want to flag these clearly, because the pattern above sounds airtight in prose and isn't, until you close these gaps.
@@ -219,6 +377,26 @@ UUID currently in `BEFORE`:
 6. Write AFTER = UUID-B with that value and its database ordering token.
 ```
 
+There are two important orderings:
+
+```text
+Repair claims first:
+  1. Repair inserts (cache_key, UUID-B) successfully.
+  2. Repair reads the current database value and confirms AFTER=UUID-B.
+  3. The slow writer later tries to insert (cache_key, UUID-B).
+  4. The unique conflict rejects the writer transaction, so its update cannot commit.
+
+Writer claims first:
+  1. The writer inserts (cache_key, UUID-B) in the same transaction as its update.
+  2. Repair tries to insert (cache_key, UUID-B) and waits for the writer transaction.
+  3. If the writer commits, repair gets a conflict and reads the committed value.
+  4. If the writer rolls back, repair's insert succeeds and it repairs the current value.
+```
+
+In both orderings, repair never needs to guess whether the slow writer committed.
+The database transaction and the unique claim decide which party owns the
+attempt.
+
 The repairer writes through the *same* ordering-gated script — it must never
 blindly overwrite, in case the value has moved on again since the key became
 dirty. It confirms the exact `BEFORE` UUID it claimed; it does not invent a new
@@ -254,4 +432,4 @@ cache misses separately from ordinary TTL misses.
 
 ## Where this leaves you
 
-If you're already running a CDC pipeline, that's still the cleaner long-term answer — one write path, no dual-write race by construction. If you're not, and you want a way to make a Redis-in-front-of-Postgres setup provably safe without adopting new infrastructure, BEFORE/AFTER fencing is a reasonably small, self-contained way to get there. It trades a bit of write-path complexity (an atomic hash, an ordering-gated confirm, a dirty set) for the guarantee that matters most: **the cache is either provably right, or it says so.**
+If you're already running a CDC pipeline, that's still the cleaner long-term answer — one write path, no dual-write race by construction. If you're not, and you want a way to make a Redis-in-front-of-a-transactional-database setup provably safe without adopting new infrastructure, BEFORE/AFTER fencing is a reasonably small, self-contained way to get there. It trades a bit of write-path complexity (an atomic hash, an ordering-gated confirm, a dirty set) for the guarantee that matters most: **the cache is either provably right, or it says so.**
