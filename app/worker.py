@@ -35,7 +35,10 @@ async def repair_user(
     repaired = await coordinator.repair_attempt(
         cache_key,
         before_uuid,
-        lambda: db.get_user(coordinator.db_pool, user_id),
+        lambda conn: conn.fetchrow(
+            "SELECT id, name, phone_number, email, version FROM users WHERE id = $1",
+            user_id,
+        ),
     )
     if repaired.get("value") is None:
         return {"action": "missing_postgres_row", "db_action": repaired.get("db_action")}

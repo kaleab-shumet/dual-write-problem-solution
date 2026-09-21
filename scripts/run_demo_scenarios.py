@@ -100,7 +100,6 @@ def summarize_debug(debug: dict[str, Any]) -> dict[str, Any]:
             "trusted": redis.get("trusted"),
             "before_uuid": redis.get("before_uuid"),
             "after_uuid": redis.get("after_uuid"),
-            "confirmed_version": redis.get("confirmed_version"),
             "value_name": (redis.get("value") or {}).get("name"),
             "value_version": (redis.get("value") or {}).get("version"),
         },
@@ -143,7 +142,7 @@ def normal_update() -> None:
         },
     )
 
-    print_step(2, "The writer wrote BEFORE, committed DB + cache_attempt, then wrote AFTER with the same UUID.")
+    print_step(2, "The writer advanced the expected attempt, committed DB + cache state, then wrote AFTER with the same UUID.")
     latest = get_user()
     print_json("Read after normal update", summarize_read(latest))
 
@@ -169,7 +168,7 @@ def crash_after_commit() -> None:
 
     print_step(
         2,
-        "A BullMQ repair job uses the same BEFORE UUID. Duplicate insert means the writer's DB transaction committed, so the worker reads Postgres and writes AFTER=BEFORE.",
+        "A BullMQ repair job reconciles the committed database attempt and writes a matching AFTER value.",
     )
     repaired = wait_for_trusted()
     print_json("Read after worker repair", summarize_read(repaired))
@@ -177,9 +176,9 @@ def crash_after_commit() -> None:
 
 
 def rejected_write() -> None:
-    print_title("Scenario 4: DB Rejects Stale Writer, Worker Claims Attempt")
+    print_title("Scenario 4: Rejected Business Operation, Worker Repairs")
 
-    print_step(1, "Simulate a stale writer. The DB update rolls back, including its cache_attempt insert.")
+    print_step(1, "Simulate a rejected business operation. The DB transaction rolls back its cache-attempt transition.")
     _, rejected = request(
         "POST",
         "/demo/rejected-write",
@@ -197,7 +196,7 @@ def rejected_write() -> None:
 
     print_step(
         2,
-        "The worker tries to insert that same UUID. Because the writer rolled back, the insert succeeds; the worker owns the attempt and confirms the still-current DB value.",
+        "The worker observes the committed database attempt and confirms the still-current DB value.",
     )
     repaired = wait_for_trusted()
     print_json("Read after worker confirms rejected attempt", summarize_read(repaired))
@@ -276,7 +275,7 @@ def main() -> None:
     concurrent_dirty_reads()
 
     print_title("Done")
-    print("The key guarantee: repair confirms only the exact BEFORE UUID it can prove via the DB cache_attempts table.")
+    print("The key guarantee: a writer can advance a cache key only when its expected AFTER attempt is still current in the database.")
 
 
 if __name__ == "__main__":

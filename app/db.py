@@ -19,10 +19,8 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS cache_attempts (
-  cache_key TEXT NOT NULL,
-  attempt_uuid UUID NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (cache_key, attempt_uuid)
+  cache_key TEXT PRIMARY KEY,
+  attempt_uuid UUID NOT NULL
 );
 
 ALTER TABLE users
@@ -79,7 +77,6 @@ async def update_user(
     user_id: str,
     name: str | None,
     phone_number: str | None,
-    expected_version: int,
 ) -> asyncpg.Record | None:
     async with pool.acquire() as conn:
         return await conn.fetchrow(
@@ -89,13 +86,11 @@ async def update_user(
                 phone_number = COALESCE($2, phone_number),
                 version = version + 1
             WHERE id = $3
-              AND version = $4
             RETURNING id, name, phone_number, email, version
             """,
             name,
             phone_number,
             user_id,
-            expected_version,
         )
 
 
@@ -103,20 +98,84 @@ async def insert_cache_attempt(
     conn: asyncpg.Connection,
     cache_key: str,
     attempt_uuid: str,
-) -> None:
-    await conn.execute(
+) -> bool:
+    row = await conn.fetchrow(
         """
         INSERT INTO cache_attempts (cache_key, attempt_uuid)
         VALUES ($1, $2::uuid)
+        ON CONFLICT (cache_key) DO NOTHING
+        RETURNING attempt_uuid
         """,
         cache_key,
         attempt_uuid,
     )
+    return row is not None
+
+
+async def advance_cache_attempt(
+    conn: asyncpg.Connection,
+    cache_key: str,
+    expected_attempt_uuid: str | None,
+    attempt_uuid: str,
+) -> bool:
+    if expected_attempt_uuid is None:
+        return await insert_cache_attempt(conn, cache_key, attempt_uuid)
+
+    row = await conn.fetchrow(
+        """
+        UPDATE cache_attempts
+        SET attempt_uuid = $3::uuid
+        WHERE cache_key = $1
+          AND attempt_uuid = $2::uuid
+        RETURNING attempt_uuid
+        """,
+        cache_key,
+        expected_attempt_uuid,
+        attempt_uuid,
+    )
+    return row is not None
+
+
+async def current_cache_attempt(
+    conn: asyncpg.Connection,
+    cache_key: str,
+) -> str | None:
+    row = await conn.fetchrow(
+        """
+        SELECT attempt_uuid::text AS attempt_uuid
+        FROM cache_attempts
+        WHERE cache_key = $1
+        FOR UPDATE
+        """,
+        cache_key,
+    )
+    return row["attempt_uuid"] if row else None
+
+
+async def bootstrap_cache_attempt(
+    pool: asyncpg.Pool,
+    cache_key: str,
+    candidate_attempt_uuid: str,
+) -> str:
+    async with pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            await insert_cache_attempt(conn, cache_key, candidate_attempt_uuid)
+            attempt_uuid = await current_cache_attempt(conn, cache_key)
+            await tx.commit()
+            if attempt_uuid is None:
+                raise RuntimeError(f"cache attempt was not initialized: {cache_key}")
+            return attempt_uuid
+        except Exception:
+            await tx.rollback()
+            raise
 
 
 async def run_with_cache_attempt(
     pool: asyncpg.Pool,
     cache_key: str,
+    expected_attempt_uuid: str | None,
     attempt_uuid: str,
     write_fn: Callable[[asyncpg.Connection], Awaitable[T | None]],
 ) -> T | None:
@@ -124,16 +183,21 @@ async def run_with_cache_attempt(
         tx = conn.transaction()
         await tx.start()
         try:
-            await insert_cache_attempt(conn, cache_key, attempt_uuid)
+            claimed = await advance_cache_attempt(
+                conn,
+                cache_key,
+                expected_attempt_uuid,
+                attempt_uuid,
+            )
+            if not claimed:
+                await tx.rollback()
+                return None
             result = await write_fn(conn)
             if result is None:
                 await tx.rollback()
                 return None
             await tx.commit()
             return result
-        except asyncpg.UniqueViolationError:
-            await tx.rollback()
-            return None
         except Exception:
             await tx.rollback()
             raise
@@ -142,20 +206,28 @@ async def run_with_cache_attempt(
 async def repair_entity_for_attempt(
     pool: asyncpg.Pool,
     cache_key: str,
+    expected_attempt_uuid: str | None,
     attempt_uuid: str,
-    fetch_fn: Callable[[], Awaitable[T | None]],
-) -> tuple[T | None, str]:
+    fetch_fn: Callable[[asyncpg.Connection], Awaitable[T | None]],
+) -> tuple[T | None, str | None, str]:
     async with pool.acquire() as conn:
         tx = conn.transaction()
         await tx.start()
         try:
-            await insert_cache_attempt(conn, cache_key, attempt_uuid)
+            claimed = await advance_cache_attempt(
+                conn,
+                cache_key,
+                expected_attempt_uuid,
+                attempt_uuid,
+            )
+            current_attempt = attempt_uuid if claimed else await current_cache_attempt(conn, cache_key)
+            row = await fetch_fn(conn)
             await tx.commit()
-            return await fetch_fn(), "repair_claimed_attempt"
-        except asyncpg.UniqueViolationError:
+            action = "repair_claimed_attempt" if claimed else "read_current_attempt"
+            return row, current_attempt, action
+        except Exception:
             await tx.rollback()
-
-    return await fetch_fn(), "attempt_already_committed"
+            raise
 
 
 async def update_user_in_tx(
@@ -163,7 +235,6 @@ async def update_user_in_tx(
     user_id: str,
     name: str | None,
     phone_number: str | None,
-    expected_version: int,
 ) -> asyncpg.Record | None:
     return await conn.fetchrow(
         """
@@ -172,40 +243,44 @@ async def update_user_in_tx(
             phone_number = COALESCE($2, phone_number),
             version = version + 1
         WHERE id = $3
-          AND version = $4
         RETURNING id, name, phone_number, email, version
         """,
         name,
         phone_number,
         user_id,
-        expected_version,
     )
 
 
 async def update_user_with_attempt(
     pool: asyncpg.Pool,
     user_id: str,
+    expected_attempt_uuid: str | None,
     attempt_uuid: str,
     name: str | None,
     phone_number: str | None,
-    expected_version: int,
 ) -> asyncpg.Record | None:
     return await run_with_cache_attempt(
         pool,
         f"user:{user_id}",
+        expected_attempt_uuid,
         attempt_uuid,
-        lambda conn: update_user_in_tx(conn, user_id, name, phone_number, expected_version),
+        lambda conn: update_user_in_tx(conn, user_id, name, phone_number),
     )
 
 
 async def repair_user_for_attempt(
     pool: asyncpg.Pool,
     user_id: str,
+    expected_attempt_uuid: str | None,
     attempt_uuid: str,
-) -> tuple[asyncpg.Record | None, str]:
+) -> tuple[asyncpg.Record | None, str | None, str]:
     return await repair_entity_for_attempt(
         pool,
         f"user:{user_id}",
+        expected_attempt_uuid,
         attempt_uuid,
-        lambda: get_user(pool, user_id),
+        lambda conn: conn.fetchrow(
+            "SELECT id, name, phone_number, email, version FROM users WHERE id = $1",
+            user_id,
+        ),
     )

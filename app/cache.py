@@ -30,27 +30,51 @@ return 1
 """
 
 
-CONFIRM_AFTER_SCRIPT = """
-local current = tonumber(redis.call('HGET', KEYS[1], 'confirmed_version') or '0')
-local incoming = tonumber(ARGV[3])
-
-if incoming > current or incoming == current then
-  redis.call(
-    'HSET', KEYS[1],
-    'after_uuid', ARGV[1],
-    'value', ARGV[2],
-    'confirmed_version', ARGV[3]
-  )
-
-  if redis.call('HGET', KEYS[1], 'before_uuid') == ARGV[1] then
-    redis.call('SREM', KEYS[2], KEYS[1])
-    return 1
-  end
-
-  return 2
+BOOTSTRAP_CACHE_SCRIPT = """
+if redis.call('HEXISTS', KEYS[1], 'before_uuid') == 1 then
+  return 0
 end
 
-return 0
+redis.call(
+  'HSET', KEYS[1],
+  'before_uuid', ARGV[1],
+  'after_uuid', ARGV[1],
+  'value', ARGV[2],
+  'before_written_at_ms', ARGV[3]
+)
+redis.call('SREM', KEYS[2], KEYS[1])
+return 1
+"""
+
+
+CONFIRM_AFTER_SCRIPT = """
+if redis.call('HGET', KEYS[1], 'before_uuid') ~= ARGV[1] then
+  return 0
+end
+
+redis.call(
+  'HSET', KEYS[1],
+  'after_uuid', ARGV[1],
+  'value', ARGV[2]
+)
+redis.call('SREM', KEYS[2], KEYS[1])
+return 1
+"""
+
+
+REPAIR_CACHE_SCRIPT = """
+if redis.call('HGET', KEYS[1], 'before_uuid') ~= ARGV[1] then
+  return 0
+end
+
+redis.call(
+  'HSET', KEYS[1],
+  'before_uuid', ARGV[2],
+  'after_uuid', ARGV[2],
+  'value', ARGV[3]
+)
+redis.call('SREM', KEYS[2], KEYS[1])
+return 1
 """
 
 
@@ -134,7 +158,6 @@ async def confirm_after(
     cache_key_value: str,
     attempt_uuid: str,
     value: dict[str, Any],
-    database_version: int,
 ) -> int:
     return int(
         await redis.eval(
@@ -144,7 +167,6 @@ async def confirm_after(
             DIRTY_KEYS_SET,
             attempt_uuid,
             encode_value(value),
-            str(database_version),
         )
     )
 
@@ -152,29 +174,39 @@ async def confirm_after(
 async def repair_from_db(
     redis: Redis,
     cache_key_value: str,
-    attempt_uuid: str,
+    observed_before_uuid: str,
+    confirmed_attempt_uuid: str,
     value: dict[str, Any],
-    database_version: int,
 ) -> int:
-    return await confirm_after(redis, cache_key_value, attempt_uuid, value, database_version)
+    return int(
+        await redis.eval(
+            REPAIR_CACHE_SCRIPT,
+            2,
+            cache_key_value,
+            DIRTY_KEYS_SET,
+            observed_before_uuid,
+            confirmed_attempt_uuid,
+            encode_value(value),
+        )
+    )
 
 
 async def set_trusted(
     redis: Redis,
     cache_key_value: str,
     value: dict[str, Any],
-    database_version: int,
-) -> None:
-    attempt_uuid = new_uuid()
-    await redis.hset(
-        cache_key_value,
-        mapping={
-            "value": encode_value(value),
-            "before_uuid": attempt_uuid,
-            "after_uuid": attempt_uuid,
-            "confirmed_version": database_version,
-            "before_written_at_ms": now_ms(),
-        },
+    attempt_uuid: str,
+) -> bool:
+    return bool(
+        await redis.eval(
+            BOOTSTRAP_CACHE_SCRIPT,
+            2,
+            cache_key_value,
+            DIRTY_KEYS_SET,
+            attempt_uuid,
+            encode_value(value),
+            str(now_ms()),
+        )
     )
     await redis.srem(DIRTY_KEYS_SET, cache_key_value)
 
@@ -196,7 +228,7 @@ def normalize_cache(data: dict[str, str]) -> dict[str, Any]:
     normalized: dict[str, Any] = dict(data)
     if "value" in normalized:
         normalized["value"] = decode_value(normalized["value"])
-    for field in ("confirmed_version", "before_written_at_ms"):
+    for field in ("before_written_at_ms",):
         if field in normalized:
             normalized[field] = int(normalized[field])
     normalized["trusted"] = bool(

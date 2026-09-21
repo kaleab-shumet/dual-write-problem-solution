@@ -14,6 +14,7 @@ from app.settings import REPAIR_WAIT_MS
 
 RowDict = dict[str, Any]
 FetchFn = Callable[[], Awaitable[asyncpg.Record | None]]
+FetchInTxFn = Callable[[asyncpg.Connection], Awaitable[asyncpg.Record | None]]
 WriteFn = Callable[[asyncpg.Connection], Awaitable[asyncpg.Record | None]]
 
 
@@ -102,7 +103,14 @@ class CacheCoordinator:
         if row is None:
             return {"served_from": "missing", "trusted_cache": False, "value": None}
 
-        await cache.set_trusted(self.redis, cache_key, dict(row), row["version"])
+        attempt_uuid = await db.bootstrap_cache_attempt(
+            self.db_pool,
+            cache_key,
+            cache.new_uuid(),
+        )
+        seeded = await cache.set_trusted(self.redis, cache_key, dict(row), attempt_uuid)
+        if not seeded:
+            return await self.read_with_worker(cache_key, fetch_db)
         return {
             "served_from": "postgres",
             "trusted_cache": True,
@@ -113,6 +121,7 @@ class CacheCoordinator:
         self,
         cache_key: str,
         fetch_db: FetchFn,
+        fetch_db_in_tx: FetchInTxFn | None = None,
     ) -> dict[str, Any]:
         cached = await cache.get_cache(self.redis, cache_key)
         if cached.get("trusted"):
@@ -128,7 +137,14 @@ class CacheCoordinator:
             row = await fetch_db()
             if row is None:
                 return {"served_from": "missing", "trusted_cache": False, "value": None}
-            await cache.set_trusted(self.redis, cache_key, dict(row), row["version"])
+            attempt_uuid = await db.bootstrap_cache_attempt(
+                self.db_pool,
+                cache_key,
+                cache.new_uuid(),
+            )
+            seeded = await cache.set_trusted(self.redis, cache_key, dict(row), attempt_uuid)
+            if not seeded:
+                return await self.read_with_singleflight(cache_key, fetch_db)
             return {
                 "served_from": "postgres_bootstrap",
                 "trusted_cache": True,
@@ -153,7 +169,8 @@ class CacheCoordinator:
                         cache_key,
                     )
 
-                result = await self.repair_attempt(cache_key, before_uuid, fetch_db)
+                repair_fetch = fetch_db_in_tx or (lambda conn: fetch_db())
+                result = await self.repair_attempt(cache_key, before_uuid, repair_fetch)
                 result["served_from"] = "postgres_singleflight_repair"
                 result["singleflight_role"] = "winner"
                 return result
@@ -190,14 +207,35 @@ class CacheCoordinator:
         *,
         confirm_after: bool = True,
         enqueue_repair_after_commit: bool = False,
+        before_delay_ms: int = 0,
+        transaction_delay_ms: int = 0,
+        after_delay_ms: int = 0,
+        reject_business: bool = False,
     ) -> dict[str, Any]:
         attempt_uuid = cache.new_uuid()
         await cache.write_before(self.redis, cache_key, attempt_uuid)
+        current_cache = await cache.get_cache(self.redis, cache_key)
+        expected_attempt_uuid = current_cache.get("after_uuid")
+
+        # Capture the expected AFTER before any demo delay. A writer must keep
+        # the expectation it observed when it raised BEFORE; adopting a newer
+        # AFTER after sleeping would let a stale operation commit.
+        if before_delay_ms:
+            await asyncio.sleep(before_delay_ms / 1000)
+
+        async def write_with_demo_controls(conn: asyncpg.Connection) -> asyncpg.Record | None:
+            if transaction_delay_ms:
+                await asyncio.sleep(transaction_delay_ms / 1000)
+            if reject_business:
+                return None
+            return await write_db(conn)
+
         row = await db.run_with_cache_attempt(
             self.db_pool,
             cache_key,
+            expected_attempt_uuid,
             attempt_uuid,
-            write_db,
+            write_with_demo_controls,
         )
         if row is None:
             await self.enqueue_repair(cache_key, attempt_uuid)
@@ -217,15 +255,17 @@ class CacheCoordinator:
                 "value": dict(row),
             }
 
+        if after_delay_ms:
+            await asyncio.sleep(after_delay_ms / 1000)
+
         confirm_result = await cache.confirm_after(
             self.redis,
             cache_key,
             attempt_uuid,
             dict(row),
-            row["version"],
         )
         return {
-            "outcome": "committed_and_confirmed",
+            "outcome": "committed_and_confirmed" if confirm_result else "committed_confirmation_rejected",
             "attempt_uuid": attempt_uuid,
             "confirm_result": confirm_result,
             "value": dict(row),
@@ -235,11 +275,14 @@ class CacheCoordinator:
         self,
         cache_key: str,
         before_uuid: str,
-        fetch_db: FetchFn,
+        fetch_db: FetchInTxFn,
     ) -> dict[str, Any]:
-        row, db_action = await db.repair_entity_for_attempt(
+        cached = await cache.get_cache(self.redis, cache_key)
+        expected_attempt_uuid = cached.get("after_uuid")
+        row, current_attempt, db_action = await db.repair_entity_for_attempt(
             self.db_pool,
             cache_key,
+            expected_attempt_uuid,
             before_uuid,
             fetch_db,
         )
@@ -255,8 +298,8 @@ class CacheCoordinator:
             self.redis,
             cache_key,
             before_uuid,
+            current_attempt or before_uuid,
             dict(row),
-            row["version"],
         )
         repaired = await cache.get_cache(self.redis, cache_key)
         return {

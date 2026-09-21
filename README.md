@@ -154,7 +154,7 @@ The default UI shows the final user-facing result: user data, version, and
 whether the response was served from Redis or Postgres.
 
 The debug UI shows the internals: Postgres state, Redis hash fields, UUIDs,
-confirmed versions, dirty keys, and scenario logs.
+dirty keys, and scenario logs.
 
 ## Run
 
@@ -192,14 +192,44 @@ Then use the scenario buttons:
 
 - **Save changes**: normal successful update. Redis becomes trusted after
   Postgres commits and `AFTER` is written.
-- **Rejected write**: Redis receives `BEFORE`, Postgres rejects the stale
-  update, and the final read falls back to Postgres.
+- **Rejected write**: Redis receives `BEFORE`, the business transaction is
+  rejected, and the dirty entry is repaired from Postgres.
 - **Crash after DB commit**: Postgres commits, Redis never receives `AFTER`,
   and the final read falls back to Postgres.
 - **Repair once**: repairs dirty Redis entries from Postgres and makes Redis
   trusted again.
 - **Delayed AFTER race**: proves an older delayed confirmation cannot clobber a
   newer confirmed cache entry.
+
+For the exact slow-writer/fast-writer race, run the deterministic walkthrough
+inside the API container:
+
+```bash
+docker compose exec api python scripts/demo_writer_race.py
+```
+
+It shows W1 writing `BEFORE` first, W2 reaching the database first and
+committing, then W1 being rejected by the database's expected-attempt check.
+
+To send several parallel configurable races, including the three-writer case,
+and print each final state:
+
+```bash
+docker compose exec api python scripts/run_parallel_races.py
+```
+
+The runner covers sequential handoff, two-writer races, all six three-writer
+arrival orders, readers during an active writer, repair during a database
+transaction, ten concurrent singleflight readers, rejected writes, skipped
+`AFTER`, and late confirmations. Separate scripts cover worker outage recovery
+and Redis outage behavior:
+
+```bash
+docker compose exec api python scripts/run_worker_failure.py prepare
+docker compose exec api python scripts/run_worker_failure.py finish
+docker compose exec api python scripts/run_redis_failure.py reset
+docker compose exec api python scripts/run_redis_failure.py verify
+```
 
 The important behavior is that the final UI never needs to understand Redis
 internals. It only sees:
@@ -242,12 +272,67 @@ Real app endpoints:
 GET   /users/{user_id}
 GET   /users/{user_id}/singleflight
 PATCH /users/{user_id}
+
+Configurable race endpoint:
+
+```text
+POST /demo/race/writer/{user_id}
+```
+
+Query parameters:
+
+```text
+writer_id              required label such as w1 or w2
+before_delay_ms        sleep after BEFORE, maximum 30000
+transaction_delay_ms   sleep inside the database transaction, maximum 30000
+after_delay_ms         sleep after commit before AFTER, maximum 30000
+skip_after             simulate a crash before AFTER
+reject_business        roll back the business transaction
+```
+
+Reader race endpoint:
+
+```text
+GET /demo/race/reader/{user_id}
+```
+
+Reader parameters:
+
+```text
+reader_id              required label such as r1
+before_read_delay_ms   sleep before reading Redis
+database_delay_ms      sleep after observing dirty Redis
+repair                 repair Redis after the database read
+singleflight            coordinate concurrent dirty readers
+```
+
+Example direct fallback while W1 is sleeping:
+
+```bash
+curl 'http://localhost:8000/demo/race/reader/42?reader_id=r1&repair=false'
+```
+
+Use `singleflight=true` to demonstrate one reader repairing while other readers
+wait for the same dirty key.
+
+Example slow W1:
+
+```bash
+curl -X POST 'http://localhost:8000/demo/race/writer/42?writer_id=w1&before_delay_ms=10000' \
+  -H 'content-type: application/json' \
+  -d '{"name":"Grace Hopper","phone_number":"+1-555-0101"}'
+```
+
+Run W2 at the same time with `writer_id=w2` and no delay. W2 can reach the
+database first, commit, and cause W1's stale expected attempt to roll back.
 ```
 
 Demo endpoints:
 
 ```text
 POST /demo/reset
+POST /demo/race/writer/{user_id}
+GET  /demo/race/reader/{user_id}
 POST /demo/rejected-write
 POST /demo/crash-after-db-commit
 POST /demo/delayed-after-race
@@ -257,6 +342,12 @@ GET  /debug/users/{user_id}
 
 ## How The Pattern Works
 
+This demo uses a **Redis-required cached-write policy**. A write must record
+`BEFORE` in Redis before PostgreSQL is changed. If Redis cannot record that
+marker, the write stops and PostgreSQL is not modified. A database-only write
+fallback is intentionally outside this demo; it would require a separate
+durable cache-health and recovery protocol.
+
 Redis stores the cached user profile as a hash:
 
 ```text
@@ -265,25 +356,25 @@ key: user:42
 value              JSON user profile
 before_uuid        UUID marker for the latest attempted write
 after_uuid         UUID for the latest confirmed write
-confirmed_version  DB row version corresponding to value
 ```
 
 On update:
 
 1. The backend writes `BEFORE` to Redis with a fresh UUID marker only.
 2. Redis is now untrusted because `before_uuid != after_uuid`.
-3. The backend updates Postgres using optimistic concurrency and gets the final
-   row back from `RETURNING`.
-4. If Postgres commits, the backend writes `AFTER` with the same UUID and the
+3. The backend reads `AFTER` as the expected database attempt.
+4. In one Postgres transaction, the backend conditionally advances the current
+   attempt and performs the business update.
+5. If Postgres commits, the backend writes `AFTER` with the same UUID and the
    confirmed full row.
-5. Redis is trusted again only if the UUIDs match.
+6. Redis is trusted again only if the UUIDs match.
 
 If Postgres rejects the update, or the app crashes after Postgres commits but
 before writing `AFTER`, Redis stays untrusted and reads fall back to Postgres.
 
-The delayed confirmation case is protected by `confirmed_version`: Redis only
-accepts an `AFTER` write if its Postgres version is newer than the current
-confirmed version.
+The delayed confirmation case is protected by a Redis compare-and-set: an
+`AFTER` write is accepted only while Redis `BEFORE` still contains that
+writer's UUID.
 
 ## Keeping Cache Code Out Of Business Logic
 
@@ -296,14 +387,13 @@ and repair scheduling:
 result = await cache_coordinator.cached_write(
     cache_key="user:42",
     write_db=lambda conn: update_user_in_tx(
-        conn, user_id, name, phone_number, expected_version
+        conn, user_id, name, phone_number
     ),
 )
 ```
 
-An aggregate uses its own opaque key, for example
-`cache_key="order:99:summary"`, and its callback can update multiple tables and
-return the complete aggregate value.
+A different protected value uses its own opaque key, for example
+`cache_key="order:99:summary"`, and its callback returns the complete value.
 
 The cache layer does not require a business-specific `expected_version`. If a
 business operation needs optimistic concurrency, it keeps that rule inside its
@@ -313,11 +403,11 @@ markers directly.
 
 ## Worker
 
-The worker consumes deduplicated BullMQ repair jobs, reads the current row from
-Postgres, and repairs untrusted cache entries using the same version-gated Redis
-script. The API and worker do not need to share a long-lived lock: the database
-attempt row decides which repair or writer owns a UUID, while Redis version
-gating prevents an older confirmation from overwriting a newer value.
+The worker consumes deduplicated BullMQ repair jobs, reads the committed current
+attempt and business row from Postgres, and repairs untrusted cache entries
+using the same Redis compare-and-set rule. The database current-attempt row
+decides which writer or repair can advance a key; Redis refuses a confirmation
+whose `BEFORE` marker has already been replaced.
 
 The worker interval is intentionally slow in the demo so you have time to see
 the fallback behavior. Use **Repair once** in the UI when you want to repair
@@ -340,8 +430,9 @@ Redis singleflight lock per dirty attempt:
 
 This is a load-reduction mechanism for concurrent reads, not the correctness
 mechanism. If the singleflight owner crashes, the lock expires and another
-request can retry. The database attempt row and Redis version gate remain the
-source of correctness, including when a worker and a direct repair race.
+request can retry. The database expected-attempt transition and Redis
+compare-and-set remain the source of correctness, including when a worker and
+a direct repair race.
 
 The defaults are suitable for the demo:
 
@@ -351,8 +442,8 @@ REPAIR_WAIT_MS=600         time followers wait for repair
 ```
 
 These settings are coordination controls, not correctness controls. UUID
-matching, database attempt claims, and database versions remain responsible for
-deciding whether a cached value is safe.
+matching and the database expected-attempt transition decide whether a cached
+value is safe.
 
 ## How This Compares To Outbox/CDC
 
@@ -400,7 +491,7 @@ Postgres a single atomic system.
   monitor dirty-key age and mismatch-driven cache misses.
 - **Singleflight is best-effort coordination.** The short Redis lock reduces
   cache stampedes for concurrent reads, but it is not a replacement for the
-  database attempt claim and version checks. Production systems should size the
+  database expected-attempt transition. Production systems should size the
   lock for their database latency, handle expiry, and monitor fallback volume
   for hot keys.
 
